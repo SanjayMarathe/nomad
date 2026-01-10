@@ -36,6 +36,8 @@ async def get_location_coordinates(location: str) -> tuple[float, float]:
     # For now, return mock coordinates for major cities
     city_coords = {
         "san francisco": (37.7749, -122.4194),
+        "santa barbara": (34.4208, -119.6982),
+        "san diego": (32.7157, -117.1611),
         "new york": (40.7128, -74.0060),
         "los angeles": (34.0522, -118.2437),
         "chicago": (41.8781, -87.6298),
@@ -246,14 +248,34 @@ async def update_map(params: dict) -> dict:
             elif isinstance(waypoint, dict) and "coordinates" in waypoint:
                 route_coordinates.append(waypoint)
         
-        # Generate a simple path (in production, use a routing service like Mapbox Directions API)
-        path_coordinates = [wp["coordinates"] for wp in route_coordinates]
+        # Generate waypoint coordinates
+        waypoint_coords = [wp["coordinates"] for wp in route_coordinates]
+        
+        # Calculate bounds from waypoints (start and end locations)
+        # This ensures the map fits the route endpoints properly
+        bounds = _calculate_bounds(waypoint_coords, padding=0.15)  # 15% padding for better view
+        
+        # Generate intermediate path points for a visible route line
+        # In production, use Mapbox Directions API or similar routing service
+        path_coordinates = []
+        for i in range(len(waypoint_coords)):
+            path_coordinates.append(waypoint_coords[i])
+            # Add intermediate points between waypoints for smoother route visualization
+            if i < len(waypoint_coords) - 1:
+                start = waypoint_coords[i]
+                end = waypoint_coords[i + 1]
+                # Generate 5 intermediate points between start and end
+                for j in range(1, 6):
+                    ratio = j / 6.0
+                    intermediate_lat = start[0] + (end[0] - start[0]) * ratio
+                    intermediate_lng = start[1] + (end[1] - start[1]) * ratio
+                    path_coordinates.append([intermediate_lat, intermediate_lng])
         
         return {
             "route_type": route_type,
             "waypoints": route_coordinates,
             "path": path_coordinates,  # Array of [lat, lng] for drawing the route
-            "bounds": _calculate_bounds(path_coordinates),
+            "bounds": bounds,  # Calculated from waypoints with padding
             "message": f"Route updated with {len(waypoints)} waypoints"
         }
     
@@ -268,19 +290,41 @@ async def update_map(params: dict) -> dict:
     }
 
 
-def _calculate_bounds(coordinates: list) -> dict:
-    """Calculate bounding box for map view"""
+def _calculate_bounds(coordinates: list, padding: float = 0.1) -> dict:
+    """Calculate bounding box for map view with padding
+    
+    Args:
+        coordinates: List of [lat, lng] coordinate pairs
+        padding: Padding factor (0.1 = 10% padding on all sides)
+    
+    Returns:
+        Dictionary with north, south, east, west bounds
+    """
     if not coordinates:
         return None
     
     lats = [coord[0] for coord in coordinates]
     lngs = [coord[1] for coord in coordinates]
     
+    # Calculate base bounds
+    min_lat = min(lats)
+    max_lat = max(lats)
+    min_lng = min(lngs)
+    max_lng = max(lngs)
+    
+    # Calculate lat/lng ranges for padding
+    lat_range = max_lat - min_lat
+    lng_range = max_lng - min_lng
+    
+    # Add padding (ensure minimum padding for very close points)
+    lat_padding = max(lat_range * padding, 0.01)  # At least 0.01 degrees
+    lng_padding = max(lng_range * padding, 0.01)
+    
     return {
-        "north": max(lats),
-        "south": min(lats),
-        "east": max(lngs),
-        "west": min(lngs)
+        "north": max_lat + lat_padding,
+        "south": min_lat - lat_padding,
+        "east": max_lng + lng_padding,
+        "west": min_lng - lng_padding
     }
 
 
