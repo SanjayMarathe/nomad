@@ -4,14 +4,30 @@ Provides travel search tools: Yelp, Tripadvisor, Hotels
 """
 
 import os
+from dotenv import load_dotenv
 from typing import Optional
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import aiohttp
 import json
 
+# Load environment variables from .env file
+load_dotenv()
+
+from solana_payment import initialize_vendor_wallet, get_vendor_public_key
+
 # Initialize FastAPI server
 app = FastAPI(title="NomadSync Travel Tools MCP Server")
+
+# Add CORS middleware to allow frontend requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # Pydantic models for tool parameters
@@ -27,6 +43,17 @@ class ActivitySearchParams(BaseModel):
 class HotelSearchParams(BaseModel):
     location: str
     budget_sol: Optional[float] = 0.0
+
+
+# Startup event to initialize vendor wallet
+@app.on_event("startup")
+async def startup_event():
+    """Initialize vendor wallet on server startup."""
+    public_key, is_new = initialize_vendor_wallet()
+    if is_new:
+        print("WARNING: New vendor wallet generated. Save the secret key to .env!")
+    else:
+        print(f"Vendor wallet loaded: {public_key}")
 
 
 # Helper function to get coordinates from location (mock for now)
@@ -297,6 +324,20 @@ async def root():
 async def health():
     """Health check endpoint"""
     return {"status": "ok"}
+
+@app.get("/api/solana/vendor")
+async def get_vendor_wallet():
+    """
+    Get the vendor's Solana public key for receiving payments.
+    Used by frontend to construct transfer transactions.
+    """
+    vendor_key = get_vendor_public_key()
+    if not vendor_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Vendor wallet not initialized"
+        )
+    return {"vendorPublicKey": vendor_key}
 
 @app.get("/tools")
 async def list_tools():
