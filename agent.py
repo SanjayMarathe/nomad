@@ -71,16 +71,27 @@ When a user mentions wanting to travel somewhere, extract locations from their n
    - Display the route as a continuous line on the map
    - Show start and end waypoint markers
 
-IMPORTANT: 
+IMPORTANT:
 - Extract location names from natural language - be smart about parsing phrases
 - Always use location names (strings), not coordinates
 - The tool handles coordinate lookup automatically
+
+PAYMENT CONFIRMATION WORKFLOW:
+When handling bookings or payments:
+1. Call generate_booking_payment with the amount and vendor address
+2. Speak to the user: "The vendor requests $XX for [item]. Would you like to proceed with the payment?"
+3. WAIT for the user to verbally confirm with "yes", "confirm", "proceed", "go ahead", or similar affirmative response
+4. ONCE user confirms, IMMEDIATELY call the confirm_payment tool (no arguments needed)
+5. The confirm_payment tool will trigger the wallet popup on the user's screen
+6. Tell the user: "Please approve the transaction in your wallet"
+
+IMPORTANT: Do NOT call confirm_payment until the user has verbally confirmed they want to proceed with the payment.
 
 Be Proactive: If users mention a city or destination, look up restaurants and activities immediately.
 
 Multi-Modal: When you find a place, tell the users about it verbally while simultaneously pushing the coordinates to the map via data messages.
 
-Financial Steward: Always confirm the price in SOL before generating a Solana payment transaction.
+Financial Steward: Always confirm the price in SOL before generating a Solana payment transaction. Wait for verbal confirmation before executing payments.
 
 Tone: Helpful, enthusiastic, and concise."""
 
@@ -271,26 +282,53 @@ class NomadSyncAgent(Agent):
             return {"error": str(e)}
     
     @function_tool()
-    async def generate_booking_payment(self, context: RunContext, amount_usd: float, recipient_address: str) -> dict:
-        """Generate a Solana payment transaction for booking
-        
+    async def generate_booking_payment(self, context: RunContext, amount_usd: float, item_description: str = "booking") -> dict:
+        """Generate a Solana payment request for booking. This sends a request to the frontend
+        and waits for user to verbally confirm before executing.
+
         Args:
             amount_usd: Amount in USD
-            recipient_address: Recipient Solana address
+            item_description: Description of what the payment is for
         """
         print(f"🔧 [TOOL CALL] Calling 'generate_booking_payment' tool")
-        print(f"   Amount: ${amount_usd} USD, Recipient: {recipient_address}")
-        
+        print(f"   Amount: ${amount_usd} USD, Item: {item_description}")
+
         try:
-            from solana_payment import generate_payment_transaction
-            result = await generate_payment_transaction(
-                amount_usd=amount_usd,
-                recipient_address=recipient_address
-            )
-            await self._send_payment_transaction(result)
-            return result
+            # Send payment request to frontend (waits for voice confirmation)
+            transaction_data = {
+                "amount_usd": amount_usd,
+                "amount_sol": 0.1,  # Fixed 0.1 SOL for devnet demo
+                "item_description": item_description,
+            }
+            await self._send_payment_transaction(transaction_data)
+            print(f"   ✅ [SUCCESS] Payment request sent to frontend")
+            return {
+                "status": "pending_confirmation",
+                "message": f"Payment request for ${amount_usd} sent. Waiting for user confirmation.",
+                "amount_usd": amount_usd,
+                "item_description": item_description
+            }
         except Exception as e:
             print(f"   ❌ [TOOL ERROR] generate_booking_payment failed: {e}")
+            return {"error": str(e)}
+
+    @function_tool()
+    async def confirm_payment(self, context: RunContext) -> dict:
+        """Execute a pending payment after user confirms verbally.
+        Call this when user says 'yes', 'confirm', 'proceed', 'go ahead', or similar
+        affirmative response after a payment request.
+
+        This triggers the wallet popup on the frontend to complete the transaction.
+        """
+        print(f"🔧 [TOOL CALL] Calling 'confirm_payment' tool")
+        print(f"   User has confirmed payment via voice")
+
+        try:
+            await self._send_payment_execute()
+            print(f"   ✅ [SUCCESS] Payment execution triggered")
+            return {"status": "payment_execution_triggered", "message": "Wallet popup triggered on frontend"}
+        except Exception as e:
+            print(f"   ❌ [TOOL ERROR] confirm_payment failed: {e}")
             return {"error": str(e)}
     
     async def _update_thinking_state(self, message: str, tool_name: str = None):
@@ -491,12 +529,23 @@ class NomadSyncAgent(Agent):
             "type": "PAYMENT_TRANSACTION",
             "transaction": transaction_data
         }
-        
+
         print(f"   📤 [PAYMENT] Sending payment transaction to frontend...")
         success = await self._send_data_message(payment_message)
         if not success:
             print(f"   ❌ [PAYMENT ERROR] Failed to send payment transaction")
-    
+
+    async def _send_payment_execute(self):
+        """Send PAYMENT_EXECUTE message to frontend to trigger wallet popup"""
+        execute_message = {
+            "type": "PAYMENT_EXECUTE"
+        }
+
+        print(f"   📤 [PAYMENT EXECUTE] Triggering wallet popup on frontend...")
+        success = await self._send_data_message(execute_message)
+        if not success:
+            print(f"   ❌ [PAYMENT EXECUTE ERROR] Failed to send payment execute message")
+
     async def _broadcast_route_update(self, route_data: dict):
         """Broadcast route update to map via LiveKit data publishing"""
         if not route_data:
