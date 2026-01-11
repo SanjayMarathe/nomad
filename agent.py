@@ -413,12 +413,17 @@ class NomadSyncAgent(Agent):
                 min_rating=min_rating
             )
             
-            # Log the result
+            # Populate cost estimates FIRST (before returning or broadcasting)
+            # This ensures LLM and UI see the same prices
+            result = self._populate_cost_estimates(result)
+            
+            # Log the result with costs
             restaurant_count = len(result.get("restaurants", []))
             print(f"   ✅ [RESULT] Found {restaurant_count} restaurants")
             if restaurant_count > 0:
                 for i, r in enumerate(result.get("restaurants", [])[:3]):
-                    print(f"      {i+1}. {r.get('name', 'Unknown')} - {r.get('rating', 'N/A')}⭐")
+                    cost = r.get('estimated_cost_per_person', '?')
+                    print(f"      {i+1}. {r.get('name', 'Unknown')} - {r.get('rating', 'N/A')}⭐ ~${cost}/person")
             
             await self._broadcast_map_update(result)
             return result
@@ -465,6 +470,9 @@ class NomadSyncAgent(Agent):
                 max_price_per_person=max_price_per_person,
                 min_rating=min_rating
             )
+            # Populate cost estimates FIRST (before returning or broadcasting)
+            result = self._populate_cost_estimates(result)
+            
             await self._broadcast_map_update(result)
             return result
         except Exception as e:
@@ -518,6 +526,9 @@ class NomadSyncAgent(Agent):
                 max_price_per_night=max_price_per_night,
                 min_rating=min_rating
             )
+            # Populate cost estimates FIRST (before returning or broadcasting)
+            result = self._populate_cost_estimates(result)
+            
             await self._broadcast_map_update(result)
             return result
         except Exception as e:
@@ -1017,14 +1028,12 @@ class NomadSyncAgent(Agent):
         return search_result
     
     async def _broadcast_map_update(self, search_result: dict):
-        """Broadcast map updates via LiveKit data publishing"""
+        """Broadcast map updates via LiveKit data publishing.
+        NOTE: Cost estimates should already be populated before calling this method.
+        """
         if not search_result or "coordinates" not in search_result:
             print(f"   ⚠️  [MAP UPDATE] No coordinates in search result, skipping broadcast")
             return
-        
-        # Populate cost estimates before broadcasting
-        search_result = self._populate_cost_estimates(search_result)
-        print(f"   💰 [COSTS] Populated cost estimates for {search_result.get('count', 0)} items")
         
         map_update = {
             "type": "MAP_UPDATE",
