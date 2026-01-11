@@ -23,6 +23,7 @@ import json
 import os
 from typing import Annotated, Optional
 from dotenv import load_dotenv
+import httpx
 
 from livekit import agents, rtc
 from livekit.agents import (
@@ -47,6 +48,63 @@ load_dotenv()
 
 # System prompt for the AI agent
 SYSTEM_PROMPT = """You are the NomadSync Travel Concierge. You are a participant in a live video call. Your goal is to help users plan a trip by using your tools.
+
+COST ESTIMATION WORKFLOW:
+When searching for restaurants, hotels, or activities, ALWAYS provide cost estimates for each result:
+
+1. **Base Estimation from Price Tier:**
+   Use Yelp's price indicator ($-$$$$) and your knowledge to estimate costs:
+   
+   RESTAURANTS (per person for a meal):
+   - $ = $10-20/person (fast casual, cafes)
+   - $$ = $20-40/person (casual dining)
+   - $$$ = $40-80/person (upscale dining)
+   - $$$$ = $80+/person (fine dining)
+   
+   HOTELS (per night, per room):
+   - $ = $80-150/night (budget hotels, hostels)
+   - $$ = $150-250/night (mid-range hotels)
+   - $$$ = $250-400/night (upscale hotels)
+   - $$$$ = $400+/night (luxury hotels)
+   
+   ACTIVITIES (per person):
+   - $ = $10-30/person (free tours, parks, basic activities)
+   - $$ = $30-75/person (museum entry, guided tours)
+   - $$$ = $75-150/person (specialty experiences)
+   - $$$$ = $150+/person (premium experiences)
+
+2. **Location Adjustments:**
+   - Major cities (SF, NYC, LA, Seattle): +20-30%
+   - Tourist hotspots (Napa, Hawaii): +30-40%
+   - Small towns/rural areas: -20-30%
+   - International destinations: adjust based on your knowledge
+
+3. **Context-Specific Adjustments:**
+   - Weekend vs weekday pricing
+   - Peak season vs off-season
+   - Breakfast vs dinner prices for restaurants
+   - Special events or holidays
+
+4. **Calculate Totals:**
+   - For restaurants: estimated_cost_per_person × num_guests
+   - For hotels: estimated_cost_per_night × nights × num_rooms
+   - For activities: estimated_cost_per_person × num_guests
+
+5. **When to Use web_search():**
+   - User asks for "exact" or "current" prices
+   - Specific hotel room rates needed
+   - Event ticket pricing
+   - Seasonal pricing verification
+
+6. **Always Include in Your Response:**
+   - Estimated cost per person/night
+   - Total estimated cost
+   - Mention it's an estimate: "roughly $X" or "around $Y"
+
+PARTICIPANT-AWARE DEFAULTS:
+- num_guests: Default to number of participants in the meeting room
+- num_rooms: Default to minimum rooms needed (2 guests per room, rounded up)
+- Always mention: "I see X people in the room, so I'll search for Y rooms"
 
 CRITICAL ROUTE PLANNING WORKFLOW:
 When a user mentions wanting to travel somewhere, extract locations from their natural language:
@@ -200,17 +258,43 @@ class NomadSyncAgent(Agent):
         except Exception as e:
             print(f"   ❌ Error triggering response: {e}")
     
+    def _get_participant_count(self) -> int:
+        """Get the number of participants in the room"""
+        try:
+            if self._room:
+                # Count all remote participants + 1 for local
+                return len(list(self._room.remote_participants.values())) + 1
+            return 1  # Default to 1 if room not available
+        except:
+            return 1
+    
     @function_tool()
-    async def search_restaurants(self, context: RunContext, location: str, food_type: str = "") -> dict:
-        """Search for restaurants in a location using Yelp
+    async def search_restaurants(
+        self, 
+        context: RunContext, 
+        location: str, 
+        food_type: str = "", 
+        num_guests: int = None,
+        max_price_per_person: float = None,
+        min_rating: float = None
+    ) -> dict:
+        """Search for restaurants in a location using Yelp. Automatically estimates costs per person.
         
         Args:
             location: City or location name
             food_type: Type of cuisine or food (optional)
+            num_guests: Number of people (defaults to participants in room)
+            max_price_per_person: Maximum price per person in USD (optional filter)
+            min_rating: Minimum star rating filter (optional, e.g., 4.0)
         """
-        print(f"🔧 [TOOL] search_restaurants(location={location}, food_type={food_type})")
+        # Auto-detect num_guests from room participants
+        if num_guests is None:
+            num_guests = self._get_participant_count()
+            print(f"🔧 [TOOL] Auto-detected {num_guests} guests from room participants")
+        
+        print(f"🔧 [TOOL] search_restaurants(location={location}, food_type={food_type}, num_guests={num_guests})")
         await self._update_thinking_state(
-            f"Searching for restaurants in {location}...",
+            f"Searching for restaurants in {location} for {num_guests} guests...",
             tool_name="search_restaurants"
         )
         
@@ -221,7 +305,10 @@ class NomadSyncAgent(Agent):
             result = await self.mcp_client.call_tool(
                 "search_restaurants",
                 location=location,
-                food_type=food_type
+                food_type=food_type,
+                num_guests=num_guests,
+                max_price_per_person=max_price_per_person,
+                min_rating=min_rating
             )
             await self._broadcast_map_update(result)
             return result
@@ -229,15 +316,30 @@ class NomadSyncAgent(Agent):
             return {"error": str(e)}
     
     @function_tool()
-    async def get_activities(self, context: RunContext, location: str) -> dict:
-        """Get top-rated activities and attractions from Tripadvisor
+    async def get_activities(
+        self, 
+        context: RunContext, 
+        location: str,
+        num_guests: int = None,
+        max_price_per_person: float = None,
+        min_rating: float = None
+    ) -> dict:
+        """Get top-rated activities and attractions. Automatically estimates costs per person.
         
         Args:
             location: City or location name
+            num_guests: Number of people (defaults to participants in room)
+            max_price_per_person: Maximum price per person in USD (optional filter)
+            min_rating: Minimum star rating filter (optional, e.g., 4.0)
         """
-        print(f"🔧 [TOOL] get_activities(location={location})")
+        # Auto-detect num_guests from room participants
+        if num_guests is None:
+            num_guests = self._get_participant_count()
+            print(f"🔧 [TOOL] Auto-detected {num_guests} guests from room participants")
+        
+        print(f"🔧 [TOOL] get_activities(location={location}, num_guests={num_guests})")
         await self._update_thinking_state(
-            f"Finding activities in {location}...",
+            f"Finding activities in {location} for {num_guests} guests...",
             tool_name="get_activities"
         )
         
@@ -247,7 +349,10 @@ class NomadSyncAgent(Agent):
         try:
             result = await self.mcp_client.call_tool(
                 "get_activities",
-                location=location
+                location=location,
+                num_guests=num_guests,
+                max_price_per_person=max_price_per_person,
+                min_rating=min_rating
             )
             await self._broadcast_map_update(result)
             return result
@@ -256,15 +361,38 @@ class NomadSyncAgent(Agent):
             return {"error": str(e)}
     
     @function_tool()
-    async def search_hotels(self, context: RunContext, location: str, budget_sol: float = 0.0) -> dict:
-        """Search for hotels and accommodations
+    async def search_hotels(
+        self, 
+        context: RunContext, 
+        location: str,
+        num_guests: int = None,
+        num_rooms: int = None,
+        nights: int = 1,
+        max_price_per_night: float = None,
+        min_rating: float = None
+    ) -> dict:
+        """Search for hotels and accommodations. Automatically estimates costs per night.
         
         Args:
             location: City or location name
-            budget_sol: Budget in SOL (optional)
+            num_guests: Number of people (defaults to participants in room)
+            num_rooms: Number of rooms needed (defaults to calculated from guests, 2 per room)
+            nights: Number of nights to stay (default: 1)
+            max_price_per_night: Maximum price per night per room in USD (optional filter)
+            min_rating: Minimum star rating filter (optional, e.g., 4.0)
         """
+        # Auto-detect num_guests from room participants
+        if num_guests is None:
+            num_guests = self._get_participant_count()
+            print(f"🔧 [TOOL] Auto-detected {num_guests} guests from room participants")
+        
+        # Calculate num_rooms if not specified (2 guests per room)
+        if num_rooms is None:
+            num_rooms = max(1, (num_guests + 1) // 2)
+            print(f"🔧 [TOOL] Calculated {num_rooms} rooms for {num_guests} guests")
+        
         print(f"🔧 [TOOL CALL] Calling 'search_hotels' tool")
-        print(f"   Location: {location}, Budget: {budget_sol} SOL")
+        print(f"   Location: {location}, Guests: {num_guests}, Rooms: {num_rooms}, Nights: {nights}")
         
         if not self.mcp_client:
             return {"error": "MCP client not initialized"}
@@ -273,7 +401,11 @@ class NomadSyncAgent(Agent):
             result = await self.mcp_client.call_tool(
                 "search_hotels",
                 location=location,
-                budget_sol=budget_sol
+                num_guests=num_guests,
+                num_rooms=num_rooms,
+                nights=nights,
+                max_price_per_night=max_price_per_night,
+                min_rating=min_rating
             )
             await self._broadcast_map_update(result)
             return result
@@ -330,6 +462,64 @@ class NomadSyncAgent(Agent):
         except Exception as e:
             print(f"   ❌ [TOOL ERROR] confirm_payment failed: {e}")
             return {"error": str(e)}
+    
+    @function_tool()
+    async def web_search(self, context: RunContext, query: str) -> dict:
+        """Search the web for real-time information like current prices, availability, or specific details.
+        Use this when you need up-to-date pricing information that isn't available from Yelp data.
+        
+        Args:
+            query: Specific search query (e.g., "Hotel Vitale San Francisco room rate 2026")
+        """
+        print(f"🔧 [TOOL CALL] Calling 'web_search' tool")
+        print(f"   Query: {query}")
+        
+        try:
+            # Use DuckDuckGo instant answers API (free, no API key needed)
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    "https://api.duckduckgo.com/",
+                    params={
+                        "q": query,
+                        "format": "json",
+                        "no_html": 1,
+                        "skip_disambig": 1
+                    }
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    abstract = data.get("AbstractText", "")
+                    answer = data.get("Answer", "")
+                    
+                    # Combine available information
+                    result_text = answer or abstract or "No specific information found"
+                    
+                    print(f"   ✅ [SUCCESS] Web search completed")
+                    print(f"   Result preview: {result_text[:100]}...")
+                    
+                    return {
+                        "query": query,
+                        "result": result_text,
+                        "source": "DuckDuckGo",
+                        "success": True
+                    }
+                else:
+                    print(f"   ⚠️ [WARNING] Search returned status {response.status_code}")
+                    return {
+                        "query": query,
+                        "result": "Unable to fetch search results",
+                        "success": False
+                    }
+                    
+        except Exception as e:
+            print(f"   ❌ [TOOL ERROR] web_search failed: {e}")
+            return {
+                "query": query,
+                "error": str(e),
+                "result": "Search failed",
+                "success": False
+            }
     
     async def _update_thinking_state(self, message: str, tool_name: str = None):
         """Helper to update thinking state in UI"""

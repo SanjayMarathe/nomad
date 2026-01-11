@@ -14,6 +14,9 @@ from pydantic import BaseModel
 import aiohttp
 import json
 
+# Import Solana vendor wallet functions
+from solana_payment import initialize_vendor_wallet, get_vendor_public_key
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -337,9 +340,13 @@ async def search_restaurants(params: dict) -> dict:
     """
     Search for restaurants in a location using Yelp Fusion AI MCP.
     Returns real-time data with ratings, reviews, photos, and more.
+    Agent will estimate costs based on price tier and add to response.
     """
     location = params.get("location")
     food_type = params.get("food_type", "")
+    num_guests = params.get("num_guests", 1)
+    max_price_per_person = params.get("max_price_per_person")
+    min_rating = params.get("min_rating")
     
     if not location:
         raise HTTPException(status_code=400, detail="location is required")
@@ -348,6 +355,7 @@ async def search_restaurants(params: dict) -> dict:
     lat, lng = await get_location_coordinates(location)
     
     print(f"🍽️ [RESTAURANTS] Searching for {food_type or 'restaurants'} in {location} ({lat}, {lng})")
+    print(f"   Filters: num_guests={num_guests}, max_price_per_person={max_price_per_person}, min_rating={min_rating}")
     
     restaurants = []
     yelp_response_text = ""
@@ -387,9 +395,15 @@ async def search_restaurants(params: dict) -> dict:
                 # Get attributes (amenities)
                 attributes = biz.get("attributes", {})
                 
+                rating = biz.get("rating", 0)
+                
+                # Apply filters
+                if min_rating and rating < min_rating:
+                    continue  # Skip restaurants below min rating
+                
                 restaurant = {
                     "name": biz.get("name", "Unknown Restaurant"),
-                    "rating": biz.get("rating", 0),
+                    "rating": rating,
                     "review_count": biz.get("review_count", 0),
                     "price": biz.get("price", "$$"),
                     "address": address,
@@ -406,6 +420,10 @@ async def search_restaurants(params: dict) -> dict:
                     "takeout": attributes.get("RestaurantsTakeOut", False),
                     "reservations": attributes.get("RestaurantsReservations", False),
                     "outdoor_seating": attributes.get("OutdoorSeating", False),
+                    # Cost estimation placeholders (agent will populate these)
+                    "num_guests": num_guests,
+                    "estimated_cost_per_person": None,  # Agent fills via LLM reasoning
+                    "estimated_total": None,  # Agent calculates: cost_per_person * num_guests
                 }
                 restaurants.append(restaurant)
             
@@ -430,6 +448,7 @@ async def search_restaurants(params: dict) -> dict:
         "restaurants": restaurants,
         "coordinates": [lat, lng],
         "count": len(restaurants),
+        "num_guests": num_guests,
         "yelp_response": yelp_response_text,
         "chat_id": yelp_chat_id,
         "yelp_available": True
@@ -441,9 +460,13 @@ async def get_activities(params: dict) -> dict:
     """
     Get top-rated activities and attractions using Yelp Fusion AI MCP.
     Returns real-time data with ratings, reviews, photos, and more.
+    Agent will estimate costs based on activity type and add to response.
     """
     location = params.get("location")
     activity_type = params.get("activity_type", "")  # Optional filter
+    num_guests = params.get("num_guests", 1)
+    max_price_per_person = params.get("max_price_per_person")
+    min_rating = params.get("min_rating")
     
     if not location:
         raise HTTPException(status_code=400, detail="location is required")
@@ -452,6 +475,7 @@ async def get_activities(params: dict) -> dict:
     lat, lng = await get_location_coordinates(location)
     
     print(f"🎯 [ACTIVITIES] Searching for activities in {location} ({lat}, {lng})")
+    print(f"   Filters: num_guests={num_guests}, max_price_per_person={max_price_per_person}, min_rating={min_rating}")
     
     activities = []
     yelp_response_text = ""
@@ -494,9 +518,15 @@ async def get_activities(params: dict) -> dict:
                 # Get attributes
                 attributes = biz.get("attributes", {})
                 
+                rating = biz.get("rating", 0)
+                
+                # Apply filters
+                if min_rating and rating < min_rating:
+                    continue  # Skip activities below min rating
+                
                 activity = {
                     "name": biz.get("name", "Unknown Activity"),
-                    "rating": biz.get("rating", 0),
+                    "rating": rating,
                     "review_count": biz.get("review_count", 0),
                     "type": primary_type,
                     "address": address,
@@ -511,6 +541,10 @@ async def get_activities(params: dict) -> dict:
                     "website": attributes.get("BusinessUrl", ""),
                     "wheelchair_accessible": attributes.get("WheelchairAccessible", False),
                     "good_for_kids": attributes.get("GoodForKids", False),
+                    # Cost estimation placeholders (agent will populate these)
+                    "num_guests": num_guests,
+                    "estimated_cost_per_person": None,  # Agent fills via LLM reasoning
+                    "estimated_total": None,  # Agent calculates: cost_per_person * num_guests
                 }
                 activities.append(activity)
             
@@ -533,6 +567,7 @@ async def get_activities(params: dict) -> dict:
         "activities": activities,
         "coordinates": [lat, lng],
         "count": len(activities),
+        "num_guests": num_guests,
         "yelp_response": yelp_response_text,
         "chat_id": yelp_chat_id,
         "yelp_available": True
@@ -544,9 +579,14 @@ async def search_hotels(params: dict) -> dict:
     """
     Search for hotels and accommodations using Yelp Fusion AI MCP.
     Returns real-time data with ratings, reviews, photos, and more.
+    Agent will estimate costs per night based on price tier and add to response.
     """
     location = params.get("location")
-    budget_sol = params.get("budget_sol", 0.0)
+    num_guests = params.get("num_guests", 1)
+    num_rooms = params.get("num_rooms", 1)
+    nights = params.get("nights", 1)
+    max_price_per_night = params.get("max_price_per_night")
+    min_rating = params.get("min_rating")
     
     if not location:
         raise HTTPException(status_code=400, detail="location is required")
@@ -555,6 +595,7 @@ async def search_hotels(params: dict) -> dict:
     lat, lng = await get_location_coordinates(location)
     
     print(f"🏨 [HOTELS] Searching for hotels in {location} ({lat}, {lng})")
+    print(f"   Filters: num_guests={num_guests}, num_rooms={num_rooms}, nights={nights}, max_price_per_night={max_price_per_night}, min_rating={min_rating}")
     
     hotels = []
     yelp_response_text = ""
@@ -604,9 +645,15 @@ async def search_hotels(params: dict) -> dict:
                 if attributes.get("DogsAllowed"):
                     amenities.append("Pet Friendly")
                 
+                rating = biz.get("rating", 0)
+                
+                # Apply filters
+                if min_rating and rating < min_rating:
+                    continue  # Skip hotels below min rating
+                
                 hotel = {
                     "name": biz.get("name", "Unknown Hotel"),
-                    "rating": biz.get("rating", 0),
+                    "rating": rating,
                     "review_count": biz.get("review_count", 0),
                     "price": biz.get("price", "$$"),
                     "address": address,
@@ -620,6 +667,12 @@ async def search_hotels(params: dict) -> dict:
                     "review_highlight": review_snippet,
                     "amenities": amenities,
                     "website": attributes.get("BusinessUrl", ""),
+                    # Cost estimation placeholders (agent will populate these)
+                    "num_guests": num_guests,
+                    "num_rooms": num_rooms,
+                    "nights": nights,
+                    "estimated_cost_per_night": None,  # Agent fills via LLM reasoning (per room)
+                    "estimated_total": None,  # Agent calculates: cost_per_night * nights * num_rooms
                 }
                 hotels.append(hotel)
             
@@ -630,20 +683,24 @@ async def search_hotels(params: dict) -> dict:
         print(f"⚠️ [HOTELS] No results found - Yelp API key may be missing")
         return {
             "location": location,
-            "budget_sol": budget_sol,
             "hotels": [],
             "coordinates": [lat, lng],
             "count": 0,
+            "num_guests": num_guests,
+            "num_rooms": num_rooms,
+            "nights": nights,
             "error": "No hotels found. Please ensure YELP_API_KEY is configured.",
             "yelp_available": bool(YELP_API_KEY and YELP_MCP_AVAILABLE)
         }
     
     return {
         "location": location,
-        "budget_sol": budget_sol,
         "hotels": hotels,
         "coordinates": [lat, lng],
         "count": len(hotels),
+        "num_guests": num_guests,
+        "num_rooms": num_rooms,
+        "nights": nights,
         "yelp_response": yelp_response_text,
         "chat_id": yelp_chat_id,
         "yelp_available": True
@@ -848,6 +905,15 @@ async def list_tools():
             }
         ]
     }
+
+
+@app.get("/api/solana/vendor")
+async def get_vendor_wallet():
+    """Get the vendor's Solana public key for receiving payments"""
+    vendor_key = get_vendor_public_key()
+    if not vendor_key:
+        raise HTTPException(status_code=500, detail="Vendor wallet not initialized")
+    return {"vendorPublicKey": vendor_key}
 
 
 if __name__ == "__main__":
