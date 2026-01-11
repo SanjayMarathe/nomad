@@ -500,10 +500,16 @@ async def search_restaurants(params: dict) -> dict:
             yelp_chat_id = result.get("chat_id")
             
             for biz in result["businesses"][:5]:  # Top 5 results
-                # Get coordinates if available
-                coords = biz.get("coordinates", {})
-                biz_lat = coords.get("latitude", lat)
-                biz_lng = coords.get("longitude", lng)
+                # Get coordinates if available (handle both list and dict formats)
+                coords = biz.get("coordinates")
+                if isinstance(coords, list) and len(coords) >= 2:
+                    biz_lat = coords[0] if coords[0] is not None else lat
+                    biz_lng = coords[1] if coords[1] is not None else lng
+                elif isinstance(coords, dict):
+                    biz_lat = coords.get("latitude", lat)
+                    biz_lng = coords.get("longitude", lng)
+                else:
+                    biz_lat, biz_lng = lat, lng
                 
                 # Get location info
                 location_info = biz.get("location", {})
@@ -627,9 +633,16 @@ async def get_activities(params: dict) -> dict:
             yelp_chat_id = result.get("chat_id")
             
             for biz in result["businesses"][:5]:  # Top 5 results
-                coords = biz.get("coordinates", {})
-                biz_lat = coords.get("latitude", lat)
-                biz_lng = coords.get("longitude", lng)
+                # Get coordinates if available (handle both list and dict formats)
+                coords = biz.get("coordinates")
+                if isinstance(coords, list) and len(coords) >= 2:
+                    biz_lat = coords[0] if coords[0] is not None else lat
+                    biz_lng = coords[1] if coords[1] is not None else lng
+                elif isinstance(coords, dict):
+                    biz_lat = coords.get("latitude", lat)
+                    biz_lng = coords.get("longitude", lng)
+                else:
+                    biz_lat, biz_lng = lat, lng
                 
                 # Get location info
                 location_info = biz.get("location", {})
@@ -754,9 +767,16 @@ async def search_hotels(params: dict) -> dict:
             yelp_chat_id = result.get("chat_id")
             
             for biz in result["businesses"][:5]:  # Top 5 results
-                coords = biz.get("coordinates", {})
-                biz_lat = coords.get("latitude", lat)
-                biz_lng = coords.get("longitude", lng)
+                # Get coordinates if available (handle both list and dict formats)
+                coords = biz.get("coordinates")
+                if isinstance(coords, list) and len(coords) >= 2:
+                    biz_lat = coords[0] if coords[0] is not None else lat
+                    biz_lng = coords[1] if coords[1] is not None else lng
+                elif isinstance(coords, dict):
+                    biz_lat = coords.get("latitude", lat)
+                    biz_lng = coords.get("longitude", lng)
+                else:
+                    biz_lat, biz_lng = lat, lng
                 
                 # Get location info
                 location_info = biz.get("location", {})

@@ -1,5 +1,5 @@
 """
-NomadSync Voice Agent - Main LiveKit Agent
+Nomad Voice Agent - Main LiveKit Agent
 Handles voice pipeline, LLM orchestration, and tool calling
 
 ENHANCED LOGGING:
@@ -47,7 +47,7 @@ from livekit.plugins.deepgram import STT as DeepgramSTT, TTS as DeepgramTTS
 load_dotenv()
 
 # System prompt for the AI agent
-SYSTEM_PROMPT = """You are the NomadSync Travel Concierge. You are a participant in a live video call. Your goal is to help users plan a trip by using your tools.
+SYSTEM_PROMPT = """You are the Nomad Travel Concierge. You are a participant in a live video call. Your goal is to help users plan a trip by using your tools.
 
 COST ESTIMATION WORKFLOW:
 When searching for restaurants, hotels, or activities, ALWAYS provide cost estimates for each result:
@@ -207,8 +207,8 @@ Wait for verbal confirmation before calling confirm_payment.
 Tone: Helpful, enthusiastic, and CONCISE. Keep responses short and to the point."""
 
 
-class NomadSyncAgent(Agent):
-    """NomadSync Voice Agent with tool calling and real-time map sync"""
+class NomadAgent(Agent):
+    """Nomad Voice Agent with tool calling and real-time map sync"""
     
     def __init__(self, *args, **kwargs):
         # Extract instructions if provided separately, otherwise use default
@@ -247,7 +247,7 @@ class NomadSyncAgent(Agent):
         
     async def on_enter(self):
         """Called when agent becomes active"""
-        print("🤖 NomadSync Agent activated")
+        print("🤖 Nomad Agent activated")
         
         try:
             # Get room reference
@@ -273,25 +273,8 @@ class NomadSyncAgent(Agent):
                 print(f"   ⚠️ MCP client failed: {e} (tools may not work)")
                 self.mcp_client = None
             
-            # Send initial greeting using TTS
-            if hasattr(self, 'session') and self.session:
-                try:
-                    # Use session.say() for direct TTS output
-                    print("   🔊 Speaking initial greeting...")
-                    await self.session.say(
-                        "Hello! I'm your NomadSync travel assistant. I'm here to help you plan your next adventure. Where would you like to go today?",
-                        allow_interruptions=True
-                    )
-                    print("   ✅ Initial greeting spoken")
-                except Exception as e:
-                    print(f"   ⚠️ Could not speak greeting: {e}")
-                    # Fallback to generate_reply
-                    try:
-                        await self.session.generate_reply(
-                            instructions="Greet the user warmly and say you're ready to help plan their trip"
-                        )
-                    except:
-                        pass
+            # Initial greeting is now handled in entrypoint after session.start()
+            print("   ✅ Agent on_enter complete - greeting will be spoken by session")
                     
         except Exception as e:
             print(f"   ❌ Error in on_enter: {e}")
@@ -1124,7 +1107,7 @@ class NomadSyncAgent(Agent):
 async def entrypoint(ctx: JobContext):
     """Entry point for the LiveKit agent - STANDARD PATTERN"""
     print("=" * 60)
-    print("🚀 NomadSync Agent Starting...")
+    print("🚀 Nomad Agent Starting...")
     print("=" * 60)
     
     try:
@@ -1164,12 +1147,15 @@ async def entrypoint(ctx: JobContext):
         if not deepgram_key:
             raise ValueError("DEEPGRAM_API_KEY not found in environment variables!")
         
-        # Use the plugin TTS class with explicit model
+        # Use the plugin TTS class with explicit API key and model
         from livekit.plugins import deepgram as deepgram_plugin
         tts = deepgram_plugin.TTS(
+            api_key=deepgram_key,  # Explicitly pass API key
             model="aura-asteria-en",  # Smooth, professional female voice
+            sample_rate=24000,  # Standard sample rate for quality
         )
-        print("   ✅ TTS model: aura-asteria-en (Deepgram)")
+        print(f"   ✅ TTS model: aura-asteria-en (Deepgram)")
+        print(f"   ✅ TTS API key: {deepgram_key[:10]}...{deepgram_key[-4:]}")
         
         # Configure VAD
         print("👂 Loading Silero VAD...")
@@ -1198,8 +1184,8 @@ async def entrypoint(ctx: JobContext):
             raise ValueError(f"Invalid LLM_PROVIDER: '{llm_provider}'")
         
         # Create agent
-        print("🤖 Creating NomadSyncAgent...")
-        agent = NomadSyncAgent(instructions=SYSTEM_PROMPT)
+        print("🤖 Creating NomadAgent...")
+        agent = NomadAgent(instructions=SYSTEM_PROMPT)
         agent._room = ctx.room
         
         # Create session
@@ -1253,11 +1239,26 @@ async def entrypoint(ctx: JobContext):
         def on_agent_speech_started(event):
             print("\n" + "=" * 60)
             print("🔊 [AGENT SPEAKING] Started speaking...")
+            print(f"   Audio track should be publishing to room: {ctx.room.name}")
+            # Check if audio track is published
+            local_participant = ctx.room.local_participant
+            audio_tracks = list(local_participant.track_publications.values())
+            audio_count = sum(1 for t in audio_tracks if t.kind == rtc.TrackKind.KIND_AUDIO)
+            print(f"   Published audio tracks: {audio_count}")
             print("=" * 60)
         
         @session.on("agent_speech_stopped")  
         def on_agent_speech_stopped(event):
             print("🔊 [AGENT SPEAKING] Stopped speaking")
+        
+        # Log track publishing events
+        @ctx.room.on("track_published")
+        def on_track_published(publication, participant):
+            print(f"📡 [TRACK PUBLISHED] {publication.kind} track by {participant.identity}")
+        
+        @ctx.room.on("local_track_published")
+        def on_local_track_published(publication):
+            print(f"📡 [LOCAL TRACK] Agent published {publication.kind} track: {publication.sid}")
         
         # Log function/tool calls from the LLM
         @session.on("function_calls_started")
@@ -1303,7 +1304,7 @@ async def entrypoint(ctx: JobContext):
         
         # Configure room options - enable audio input and output
         room_options = room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(),
+            audio_input=room_io.AudioInputOptions(),  # Default input options
             audio_output=True,  # Enable audio output for TTS
         )
         
@@ -1312,6 +1313,29 @@ async def entrypoint(ctx: JobContext):
             room=ctx.room,
             room_options=room_options,
         )
+        
+        # Verify audio is properly set up
+        print(f"   📡 Room state: {ctx.room.connection_state}")
+        print(f"   📡 Local participant: {ctx.room.local_participant.identity}")
+        
+        # Send initial greeting AFTER session starts
+        print("🔊 Speaking initial greeting...")
+        try:
+            await session.say(
+                "Hello! I'm your Nomad travel assistant. I'm here to help you plan your next adventure. Where would you like to go today?",
+                allow_interruptions=True
+            )
+            print("   ✅ Initial greeting spoken via session.say()")
+        except Exception as greeting_err:
+            print(f"   ⚠️ session.say() failed: {greeting_err}")
+            # Fallback to generate_reply
+            try:
+                await session.generate_reply(
+                    instructions="Greet the user warmly and say you're the Nomad travel assistant ready to help plan their trip"
+                )
+                print("   ✅ Initial greeting via generate_reply()")
+            except Exception as e2:
+                print(f"   ⚠️ generate_reply() also failed: {e2}")
         
         print("\n" + "=" * 60)
         print("✅ AGENT READY - LISTENING FOR SPEECH")
@@ -1356,7 +1380,9 @@ if __name__ == "__main__":
     worker_options = WorkerOptions(
         entrypoint_fnc=entrypoint,
         num_idle_processes=1,  # Only keep 1 idle process
+        agent_name="nomad-agent",  # CRITICAL: Must match frontend dispatch name
     )
     
+    print(f"   Agent name: nomad-agent")
     cli.run_app(worker_options)
 
