@@ -145,13 +145,61 @@ When handling bookings or payments:
 
 IMPORTANT: Do NOT call confirm_payment until the user has verbally confirmed they want to proceed with the payment.
 
+CONCISE SPEECH GUIDELINES (CRITICAL):
+You MUST be extremely concise. Only provide essential information unless the user asks for more details.
+
+1. **LIMIT RESULTS (CRITICAL):**
+   - ONLY mention 1-3 TOP options, never more
+   - Pick the most relevant based on rating, reviews, and user preferences
+   - Even if you find 10 results, only speak about the TOP 1-3
+   - Say "I found a few great options" NOT "I found 10 restaurants"
+   
+2. **For each result, ONLY mention:**
+   - Name of the place
+   - Rating (spoken as words, e.g., "four point five stars")
+   - Estimated cost
+   
+   GOOD: "I found two great options. First, Chez Panisse with four point five stars, around $55 per person. Second, Gather with four stars, around $35."
+   BAD: Listing 5+ restaurants with addresses and detailed descriptions.
+
+3. **Rating Grammar (CRITICAL):**
+   - Say "stars" NOT "star star"
+   - Say "four point five stars" NOT "4.5 star star" or "4.5 stars stars"
+   - For whole numbers: "four stars" NOT "4 stars"
+   
+4. **Keep it SHORT:**
+   - Each place gets ONE sentence max
+   - Total response should be under 30 seconds of speech
+
+5. **Only provide extra details when:**
+   - User explicitly asks (e.g., "tell me more about that restaurant")
+   - User asks for address, phone, hours, etc.
+   - User asks "what else did you find?" - then mention 1-2 more
+
+ITINERARY MANAGEMENT:
+Users can add items to their trip itinerary either by:
+1. Clicking "Add to Itinerary" button on map markers
+2. Telling you verbally: "add that to my itinerary" or "add Chez Panisse to my list"
+
+When user wants to add something to itinerary:
+- Call add_to_itinerary() with the item details
+- Confirm: "Added [name] to your itinerary."
+
+When user wants to remove something:
+- Call remove_from_itinerary() with the item name
+- Confirm: "Removed [name] from your itinerary."
+
+When user wants to clear itinerary:
+- Call clear_itinerary()
+- Confirm: "Cleared your itinerary."
+
 Be Proactive: If users mention a city or destination, look up restaurants and activities immediately.
 
 Multi-Modal: When you find a place, tell the users about it verbally while simultaneously pushing the coordinates to the map via data messages.
 
 Financial Steward: Always confirm the price in SOL before generating a Solana payment transaction. Wait for verbal confirmation before executing payments.
 
-Tone: Helpful, enthusiastic, and concise."""
+Tone: Helpful, enthusiastic, and CONCISE. Keep responses short and to the point."""
 
 
 class NomadSyncAgent(Agent):
@@ -294,11 +342,18 @@ class NomadSyncAgent(Agent):
             traceback.print_exc()
     
     def _get_participant_count(self) -> int:
-        """Get the number of participants in the room"""
+        """Get the number of HUMAN participants in the room (excludes agents)"""
         try:
             if self._room:
-                # Count all remote participants + 1 for local
-                return len(list(self._room.remote_participants.values())) + 1
+                # Count only human participants from remote participants (exclude agents)
+                # NOTE: The local participant IS the agent, so we don't add +1
+                # All human users are remote participants from the agent's perspective
+                human_count = sum(
+                    1 for p in self._room.remote_participants.values()
+                    if not p.identity.lower().startswith("agent")
+                )
+                # Return at least 1 (solo user)
+                return max(1, human_count)
             return 1  # Default to 1 if room not available
         except:
             return 1
@@ -512,6 +567,83 @@ class NomadSyncAgent(Agent):
             return {"status": "payment_execution_triggered", "message": "Wallet popup triggered on frontend"}
         except Exception as e:
             print(f"   ❌ [TOOL ERROR] confirm_payment failed: {e}")
+            return {"error": str(e)}
+    
+    @function_tool()
+    async def add_to_itinerary(
+        self, 
+        context: RunContext, 
+        item_name: str,
+        item_type: str,
+        estimated_cost: float,
+        cost_label: str = "",
+        location: str = ""
+    ) -> dict:
+        """Add an item to the user's trip itinerary.
+        
+        Args:
+            item_name: Name of the restaurant, hotel, or activity
+            item_type: Type of item - "restaurant", "hotel", or "activity"
+            estimated_cost: Total estimated cost for the item
+            cost_label: Cost description (e.g., "$35/person" or "$180/night")
+            location: Location/address of the item
+        """
+        print(f"🔧 [TOOL CALL] add_to_itinerary")
+        print(f"   Item: {item_name}, Type: {item_type}, Cost: ${estimated_cost}")
+        
+        try:
+            itinerary_message = {
+                "type": "ITINERARY_ADD",
+                "item": {
+                    "id": f"{item_type}-{item_name.lower().replace(' ', '-')}",
+                    "name": item_name,
+                    "type": item_type,
+                    "estimatedCost": estimated_cost,
+                    "costLabel": cost_label or f"${int(estimated_cost)}",
+                    "location": location
+                }
+            }
+            await self._send_data_message(itinerary_message)
+            print(f"   ✅ [SUCCESS] Added {item_name} to itinerary")
+            return {"status": "added", "item": item_name}
+        except Exception as e:
+            print(f"   ❌ [TOOL ERROR] add_to_itinerary failed: {e}")
+            return {"error": str(e)}
+    
+    @function_tool()
+    async def remove_from_itinerary(self, context: RunContext, item_name: str) -> dict:
+        """Remove an item from the user's trip itinerary.
+        
+        Args:
+            item_name: Name of the item to remove
+        """
+        print(f"🔧 [TOOL CALL] remove_from_itinerary")
+        print(f"   Removing: {item_name}")
+        
+        try:
+            itinerary_message = {
+                "type": "ITINERARY_REMOVE",
+                "item_name": item_name
+            }
+            await self._send_data_message(itinerary_message)
+            print(f"   ✅ [SUCCESS] Removed {item_name} from itinerary")
+            return {"status": "removed", "item": item_name}
+        except Exception as e:
+            print(f"   ❌ [TOOL ERROR] remove_from_itinerary failed: {e}")
+            return {"error": str(e)}
+    
+    @function_tool()
+    async def clear_itinerary(self, context: RunContext) -> dict:
+        """Clear all items from the user's trip itinerary."""
+        print(f"🔧 [TOOL CALL] clear_itinerary")
+        
+        try:
+            itinerary_message = {"type": "ITINERARY_CLEAR"}
+            await self._send_data_message(itinerary_message)
+            print(f"   ✅ [SUCCESS] Cleared itinerary")
+            return {"status": "cleared"}
+        except Exception as e:
+            print(f"   ❌ [TOOL ERROR] clear_itinerary failed: {e}")
             return {"error": str(e)}
     
     @function_tool()
@@ -744,11 +876,71 @@ class NomadSyncAgent(Agent):
         except Exception as e:
             return False
     
+    def _estimate_cost_from_price_tier(self, price_tier: str, item_type: str, location: str = "") -> int:
+        """Estimate cost based on Yelp price tier ($-$$$$) and item type"""
+        # Base prices for each tier
+        base_prices = {
+            "restaurant": {"$": 15, "$$": 30, "$$$": 55, "$$$$": 100},
+            "hotel": {"$": 100, "$$": 180, "$$$": 300, "$$$$": 500},
+            "activity": {"$": 20, "$$": 50, "$$$": 100, "$$$$": 200},
+        }
+        
+        # Location multipliers (expensive cities)
+        expensive_cities = ["san francisco", "sf", "new york", "nyc", "los angeles", "la", 
+                          "seattle", "boston", "miami", "chicago", "washington dc", "hawaii"]
+        location_lower = location.lower() if location else ""
+        location_multiplier = 1.2 if any(city in location_lower for city in expensive_cities) else 1.0
+        
+        # Get base price
+        tier = price_tier if price_tier in ["$", "$$", "$$$", "$$$$"] else "$$"
+        prices = base_prices.get(item_type, base_prices["restaurant"])
+        base_price = prices.get(tier, prices["$$"])
+        
+        # Apply location multiplier and return
+        return int(base_price * location_multiplier)
+    
+    def _populate_cost_estimates(self, search_result: dict) -> dict:
+        """Populate estimated costs for restaurants, hotels, and activities"""
+        location = search_result.get("location", "")
+        num_guests = search_result.get("num_guests", 1)
+        num_rooms = search_result.get("num_rooms", 1)
+        nights = search_result.get("nights", 1)
+        
+        # Process restaurants
+        if "restaurants" in search_result:
+            for r in search_result["restaurants"]:
+                price_tier = r.get("price", "$$")
+                cost_per_person = self._estimate_cost_from_price_tier(price_tier, "restaurant", location)
+                r["estimated_cost_per_person"] = cost_per_person
+                r["estimated_total"] = cost_per_person * num_guests
+        
+        # Process hotels
+        if "hotels" in search_result:
+            for h in search_result["hotels"]:
+                price_tier = h.get("price", "$$")
+                cost_per_night = self._estimate_cost_from_price_tier(price_tier, "hotel", location)
+                h["estimated_cost_per_night"] = cost_per_night
+                h["estimated_total"] = cost_per_night * num_rooms * nights
+        
+        # Process activities
+        if "activities" in search_result:
+            for a in search_result["activities"]:
+                price_tier = a.get("price", "$$") if a.get("price") else "$$"
+                cost_per_person = self._estimate_cost_from_price_tier(price_tier, "activity", location)
+                a["estimated_cost_per_person"] = cost_per_person
+                a["estimated_total"] = cost_per_person * num_guests
+        
+        return search_result
+    
     async def _broadcast_map_update(self, search_result: dict):
         """Broadcast map updates via LiveKit data publishing"""
         if not search_result or "coordinates" not in search_result:
             print(f"   ⚠️  [MAP UPDATE] No coordinates in search result, skipping broadcast")
             return
+        
+        # Populate cost estimates before broadcasting
+        search_result = self._populate_cost_estimates(search_result)
+        print(f"   💰 [COSTS] Populated cost estimates for {search_result.get('count', 0)} items")
         
         map_update = {
             "type": "MAP_UPDATE",
@@ -847,7 +1039,22 @@ async def entrypoint(ctx: JobContext):
         print("📡 Connecting to LiveKit room...")
         await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
         print(f"   ✅ Connected to room: {ctx.room.name}")
-        print(f"   Agent identity: {ctx.agent.identity}")
+        print(f"   Agent identity: {ctx.room.local_participant.identity}")
+        
+        # CRITICAL: Check if there's already another agent in the room
+        # Only allow 1 agent per room
+        existing_agents = [
+            p for p in ctx.room.remote_participants.values()
+            if p.identity.lower().startswith("agent")
+        ]
+        
+        if existing_agents:
+            print(f"   ⚠️  ANOTHER AGENT ALREADY IN ROOM: {[a.identity for a in existing_agents]}")
+            print(f"   🚫 Disconnecting to maintain single-agent policy...")
+            await ctx.room.disconnect()
+            return  # Exit early - don't start this agent
+        
+        print(f"   ✅ No other agents in room - proceeding as the sole agent")
         
         # Configure STT
         print("🎤 Configuring Deepgram STT...")
