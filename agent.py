@@ -165,21 +165,31 @@ class NomadSyncAgent(Agent):
             print(f"   ❌ Error in on_enter: {e}")
     
     async def on_user_turn_completed(self, turn_ctx, new_message):
-        """Called after user speaks - AgentSession handles LLM response automatically"""
+        """Called after user speaks - triggers LLM to respond and potentially call tools"""
         message = new_message.text_content if hasattr(new_message, 'text_content') else str(new_message)
         
-        # Simple log of what user said
         print(f"🎧 [HEARD] \"{message}\"")
         
-        # Detect if this looks like a route planning request
+        # Detect route planning intent for logging
         message_lower = message.lower()
-        if any(kw in message_lower for kw in ["go to", "trip to", "route", "travel", "drive to", "from", "to"]):
-            print(f"   📍 Route intent detected - agent should call update_map tool")
+        if any(kw in message_lower for kw in ["go to", "trip to", "route", "travel", "drive to", "from", "to", "plan"]):
+            print(f"   📍 Route intent detected - LLM should call update_map tool")
         
-        # NOTE: AgentSession automatically triggers LLM response after user turn
-        # No need to manually call generate_reply() - the session handles this
+        # IMPORTANT: Must call generate_reply() to trigger LLM processing and tool calls
+        try:
+            if hasattr(self, 'session') and self.session:
+                print(f"   🧠 Triggering LLM response...")
+                await self.session.generate_reply(
+                    user_input=message,
+                    allow_interruptions=True
+                )
+                print(f"   ✅ LLM response triggered")
+            else:
+                print(f"   ❌ Session not available - cannot respond")
+        except Exception as e:
+            print(f"   ❌ Error triggering response: {e}")
     
-    @function_tool
+    @function_tool()
     async def search_restaurants(self, context: RunContext, location: str, food_type: str = "") -> dict:
         """Search for restaurants in a location using Yelp
         
@@ -207,7 +217,7 @@ class NomadSyncAgent(Agent):
         except Exception as e:
             return {"error": str(e)}
     
-    @function_tool
+    @function_tool()
     async def get_activities(self, context: RunContext, location: str) -> dict:
         """Get top-rated activities and attractions from Tripadvisor
         
@@ -234,7 +244,7 @@ class NomadSyncAgent(Agent):
             print(f"   ❌ [TOOL ERROR] get_activities failed: {e}")
             return {"error": str(e)}
     
-    @function_tool
+    @function_tool()
     async def search_hotels(self, context: RunContext, location: str, budget_sol: float = 0.0) -> dict:
         """Search for hotels and accommodations
         
@@ -260,7 +270,7 @@ class NomadSyncAgent(Agent):
             print(f"   ❌ [TOOL ERROR] search_hotels failed: {e}")
             return {"error": str(e)}
     
-    @function_tool
+    @function_tool()
     async def generate_booking_payment(self, context: RunContext, amount_usd: float, recipient_address: str) -> dict:
         """Generate a Solana payment transaction for booking
         
@@ -297,7 +307,7 @@ class NomadSyncAgent(Agent):
         except Exception as e:
             pass  # Silently fail - don't spam logs
     
-    @function_tool
+    @function_tool()
     async def update_map(self, context: RunContext, waypoints: list[str] = None, route_description: str = "", route_type: str = "driving") -> dict:
         """Update the map with a route or path based on travel plans. Use this when users describe a trip itinerary, route, or mention multiple locations to visit in sequence.
         
