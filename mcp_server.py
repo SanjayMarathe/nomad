@@ -269,9 +269,99 @@ async def get_route_from_mapbox(waypoint_coords: list, route_type: str = "drivin
         return None
 
 
-async def call_yelp_fusion_ai(query: str, lat: float = None, lng: float = None, chat_id: str = None) -> dict:
+async def call_yelp_business_search_v3(
+    term: str, 
+    location: str, 
+    lat: float = None, 
+    lng: float = None,
+    categories: str = None,
+    limit: int = 10
+) -> dict:
+    """
+    FALLBACK: Call Yelp Business Search API v3 when Fusion AI is rate limited.
+    This is the standard Yelp API with different rate limits.
+    """
+    if not YELP_API_KEY:
+        print("⚠️ [YELP V3] No API key configured")
+        return None
+    
+    print(f"🔄 [YELP V3 FALLBACK] Searching: term='{term}', location='{location}'")
+    
+    try:
+        import httpx
+        
+        params = {
+            "term": term,
+            "location": location,
+            "limit": limit,
+            "sort_by": "best_match"
+        }
+        
+        # Add coordinates if available for better results
+        if lat is not None and lng is not None:
+            params["latitude"] = lat
+            params["longitude"] = lng
+        
+        # Add categories if specified
+        if categories:
+            params["categories"] = categories
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.yelp.com/v3/businesses/search",
+                headers={
+                    "Authorization": f"Bearer {YELP_API_KEY}",
+                    "Accept": "application/json"
+                },
+                params=params,
+                timeout=15.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                businesses = data.get("businesses", [])
+                print(f"✅ [YELP V3] Found {len(businesses)} businesses")
+                
+                # Transform v3 response to match our expected format
+                transformed_businesses = []
+                for b in businesses:
+                    coords = b.get("coordinates", {})
+                    transformed_businesses.append({
+                        "id": b.get("id"),
+                        "name": b.get("name"),
+                        "rating": b.get("rating"),
+                        "review_count": b.get("review_count"),
+                        "price": b.get("price", "$$"),
+                        "phone": b.get("phone"),
+                        "address": ", ".join(b.get("location", {}).get("display_address", [])),
+                        "coordinates": [coords.get("latitude"), coords.get("longitude")] if coords else None,
+                        "categories": [c.get("title") for c in b.get("categories", [])],
+                        "image_url": b.get("image_url"),
+                        "yelp_url": b.get("url"),
+                        "is_closed": b.get("is_closed", False)
+                    })
+                
+                return {
+                    "businesses": transformed_businesses,
+                    "total": data.get("total", len(transformed_businesses)),
+                    "source": "yelp_v3_fallback"
+                }
+            elif response.status_code == 429:
+                print(f"❌ [YELP V3] Also rate limited (429)")
+                return None
+            else:
+                print(f"❌ [YELP V3] Error {response.status_code}: {response.text[:200]}")
+                return None
+                
+    except Exception as e:
+        print(f"❌ [YELP V3] Exception: {e}")
+        return None
+
+
+async def call_yelp_fusion_ai(query: str, lat: float = None, lng: float = None, chat_id: str = None, fallback_term: str = None, fallback_location: str = None, fallback_categories: str = None) -> dict:
     """
     Call Yelp Fusion AI API using the yelp-mcp module for real-time business data.
+    Falls back to Yelp Business Search API v3 if Fusion AI returns 429 rate limit.
     Returns structured business data with ratings, reviews, and more.
     """
     if not YELP_API_KEY:
@@ -279,7 +369,15 @@ async def call_yelp_fusion_ai(query: str, lat: float = None, lng: float = None, 
         return None
     
     if not YELP_MCP_AVAILABLE:
-        print("⚠️ [YELP] Yelp MCP module not available")
+        print("⚠️ [YELP] Yelp MCP module not available, trying v3 fallback...")
+        if fallback_term and fallback_location:
+            return await call_yelp_business_search_v3(
+                term=fallback_term,
+                location=fallback_location,
+                lat=lat,
+                lng=lng,
+                categories=fallback_categories
+            )
         return None
     
     print(f"🔍 [YELP MCP] Querying: '{query}'")
@@ -300,7 +398,16 @@ async def call_yelp_fusion_ai(query: str, lat: float = None, lng: float = None, 
         )
         
         if not response:
-            print("❌ [YELP MCP] No response from Yelp API")
+            # Fusion AI failed - try v3 fallback
+            print("⚠️ [YELP MCP] No response, trying v3 fallback...")
+            if fallback_term and fallback_location:
+                return await call_yelp_business_search_v3(
+                    term=fallback_term,
+                    location=fallback_location,
+                    lat=lat,
+                    lng=lng,
+                    categories=fallback_categories
+                )
             return None
         
         # Extract data from response
@@ -325,11 +432,26 @@ async def call_yelp_fusion_ai(query: str, lat: float = None, lng: float = None, 
             "response_text": response_text,
             "businesses": businesses,
             "formatted_response": formatted,
-            "raw_response": response
+            "raw_response": response,
+            "source": "yelp_fusion_ai"
         }
         
     except Exception as e:
+        error_str = str(e).lower()
         print(f"❌ [YELP MCP] Error: {e}")
+        
+        # Check if it's a rate limit error (429)
+        if "429" in str(e) or "rate" in error_str or "limit" in error_str or "access_limit" in error_str:
+            print("🔄 [YELP] Rate limited on Fusion AI, trying v3 fallback...")
+            if fallback_term and fallback_location:
+                return await call_yelp_business_search_v3(
+                    term=fallback_term,
+                    location=fallback_location,
+                    lat=lat,
+                    lng=lng,
+                    categories=fallback_categories
+                )
+        
         import traceback
         traceback.print_exc()
         return None
@@ -361,10 +483,17 @@ async def search_restaurants(params: dict) -> dict:
     yelp_response_text = ""
     yelp_chat_id = None
     
-    # Use Yelp Fusion AI via MCP
-    if YELP_API_KEY and YELP_MCP_AVAILABLE:
+    # Use Yelp Fusion AI via MCP (with v3 fallback for rate limits)
+    if YELP_API_KEY:
         query = f"Find the best {food_type + ' ' if food_type else ''}restaurants in {location}"
-        result = await call_yelp_fusion_ai(query, lat, lng)
+        result = await call_yelp_fusion_ai(
+            query=query, 
+            lat=lat, 
+            lng=lng,
+            fallback_term=f"{food_type} restaurants" if food_type else "restaurants",
+            fallback_location=location,
+            fallback_categories="restaurants,food"
+        )
         
         if result and result.get("businesses"):
             yelp_response_text = result.get("response_text", "")
@@ -481,10 +610,17 @@ async def get_activities(params: dict) -> dict:
     yelp_response_text = ""
     yelp_chat_id = None
     
-    # Use Yelp Fusion AI via MCP
-    if YELP_API_KEY and YELP_MCP_AVAILABLE:
+    # Use Yelp Fusion AI via MCP (with v3 fallback for rate limits)
+    if YELP_API_KEY:
         query = f"What are the top {activity_type + ' ' if activity_type else ''}things to do and attractions in {location}?"
-        result = await call_yelp_fusion_ai(query, lat, lng)
+        result = await call_yelp_fusion_ai(
+            query=query, 
+            lat=lat, 
+            lng=lng,
+            fallback_term=f"{activity_type} activities" if activity_type else "things to do",
+            fallback_location=location,
+            fallback_categories="active,arts,tours"
+        )
         
         if result and result.get("businesses"):
             yelp_response_text = result.get("response_text", "")
@@ -601,10 +737,17 @@ async def search_hotels(params: dict) -> dict:
     yelp_response_text = ""
     yelp_chat_id = None
     
-    # Use Yelp Fusion AI via MCP
-    if YELP_API_KEY and YELP_MCP_AVAILABLE:
+    # Use Yelp Fusion AI via MCP (with v3 fallback for rate limits)
+    if YELP_API_KEY:
         query = f"Find the best hotels and places to stay in {location}"
-        result = await call_yelp_fusion_ai(query, lat, lng)
+        result = await call_yelp_fusion_ai(
+            query=query, 
+            lat=lat, 
+            lng=lng,
+            fallback_term="hotels",
+            fallback_location=location,
+            fallback_categories="hotels,hostels,bedbreakfast"
+        )
         
         if result and result.get("businesses"):
             yelp_response_text = result.get("response_text", "")
