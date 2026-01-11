@@ -222,6 +222,73 @@ payment transaction.
 Tone: Helpful, enthusiastic, and concise.
 ```
 
+## Devnet Payment Demo
+
+This branch (`feature/verify-enough-info`) includes a complete voice-confirmed Solana devnet payment flow.
+
+### Quick Start - Payment Demo
+
+**1. Start the backend:**
+```bash
+# Terminal 1: MCP Server (handles vendor wallet)
+python mcp_server.py
+
+# Terminal 2: Voice Agent
+python agent.py dev
+```
+
+**2. Start the frontend:**
+```bash
+cd sb_hacks_frontend/y
+npm install
+npm run dev
+```
+
+**3. Open http://localhost:3000/meeting**
+
+**4. Connect Phantom Wallet (Devnet):**
+- A wallet connection overlay will appear
+- Click "Select Wallet" and choose Phantom
+- Ensure Phantom is set to **Devnet** (Settings > Developer Settings > Change Network)
+- Fund your devnet wallet: `solana airdrop 2 <your-address> --url devnet`
+
+**5. Test the payment flow:**
+- Join a LiveKit room
+- Say: "I'd like to book a hotel for $100"
+- Agent: "The vendor requests $100 for hotel booking. Would you like to proceed?"
+- Say: "Yes, confirm"
+- Agent triggers wallet popup
+- Approve the transaction in Phantom
+- See success status with devnet explorer link
+
+### Vendor Wallet Setup
+
+On first run, the backend generates a new vendor wallet and prints:
+```
+============================================================
+  NEW VENDOR WALLET GENERATED
+============================================================
+Public Key: <vendor-pubkey>
+
+Add this to your .env file:
+VENDOR_SECRET_KEY=<base58-encoded-secret>
+
+Fund wallet on devnet:
+solana airdrop 2 <vendor-pubkey> --url devnet
+============================================================
+```
+
+To persist the vendor wallet, add `VENDOR_SECRET_KEY` to your `.env` file.
+
+### API Endpoints
+
+```bash
+# Get vendor public key
+curl http://localhost:8000/api/solana/vendor
+```
+
+---
+
 ## Example Conversation Flow
 
 1. **User**: "I'm planning a trip to San Francisco"
