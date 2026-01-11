@@ -10,6 +10,10 @@ from pydantic import BaseModel
 import aiohttp
 import json
 
+# Mapbox Directions API configuration
+MAPBOX_ACCESS_TOKEN = os.getenv("MAPBOX_ACCESS_TOKEN") or os.getenv("NEXT_PUBLIC_MAPBOX_TOKEN")
+MAPBOX_DIRECTIONS_API = "https://api.mapbox.com/directions/v5"
+
 # Initialize FastAPI server
 app = FastAPI(title="NomadSync Travel Tools MCP Server")
 
@@ -45,6 +49,8 @@ async def get_location_coordinates(location: str) -> tuple[float, float]:
         "paris": (48.8566, 2.3522),
         "london": (51.5074, -0.1278),
         "tokyo": (35.6762, 139.6503),
+        "oakland": (37.8044, -122.2712),
+        "berkeley": (37.8715, -122.2730),
     }
     
     location_lower = location.lower()
@@ -54,6 +60,116 @@ async def get_location_coordinates(location: str) -> tuple[float, float]:
     
     # Default to San Francisco if not found
     return (37.7749, -122.4194)
+
+
+async def get_route_from_mapbox(waypoint_coords: list, route_type: str = "driving") -> Optional[dict]:
+    """
+    Get route from Mapbox Directions API
+    
+    Args:
+        waypoint_coords: List of [lat, lng] coordinate pairs
+        route_type: Route profile - 'driving', 'walking', 'cycling', or 'driving-traffic'
+    
+    Returns:
+        Dictionary with path coordinates and route information, or None if API call fails
+    """
+    if not MAPBOX_ACCESS_TOKEN:
+        print("⚠️ Mapbox Directions API: No access token found. Set MAPBOX_ACCESS_TOKEN or NEXT_PUBLIC_MAPBOX_TOKEN in environment.")
+        return None
+    
+    if len(waypoint_coords) < 2:
+        return None
+    
+    # Map route_type to Mapbox profile (must include "mapbox/" prefix)
+    profile_map = {
+        "driving": "mapbox/driving",
+        "walking": "mapbox/walking",
+        "cycling": "mapbox/cycling",
+        "transit": "mapbox/driving"  # Mapbox doesn't have transit, use driving
+    }
+    profile = profile_map.get(route_type, "mapbox/driving")
+    
+    # Convert coordinates from [lat, lng] to [lng, lat] format for Mapbox API
+    # Mapbox expects: {lng},{lat};{lng},{lat} (semicolon-separated)
+    coordinates_str = ";".join([f"{coord[1]},{coord[0]}" for coord in waypoint_coords])
+    
+    # Build API URL according to: https://api.mapbox.com/directions/v5/{profile}/{coordinates}
+    url = f"{MAPBOX_DIRECTIONS_API}/{profile}/{coordinates_str}"
+    params = {
+        "geometries": "geojson",
+        "access_token": MAPBOX_ACCESS_TOKEN,
+        "overview": "full"  # Get full geometry for detailed route
+    }
+    
+    print(f"🗺️ [MAPBOX API] Requesting route: {profile}")
+    print(f"   URL: {url.split('?')[0]}")  # Don't log token
+    print(f"   Waypoints: {len(waypoint_coords)} coordinates")
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                response_text = await response.text()
+                
+                if response.status == 200:
+                    try:
+                        data = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        print(f"❌ [MAPBOX API] Invalid JSON response: {response_text[:200]}")
+                        return None
+                    
+                    # Check for API error codes in response
+                    if data.get("code") and data.get("code") != "Ok":
+                        print(f"❌ [MAPBOX API] Error code: {data.get('code')} - {data.get('message', 'Unknown error')}")
+                        return None
+                    
+                    if data.get("routes") and len(data["routes"]) > 0:
+                        route = data["routes"][0]
+                        geometry = route.get("geometry", {})
+                        coordinates = geometry.get("coordinates", [])
+                        
+                        if not coordinates or len(coordinates) < 2:
+                            print(f"⚠️ [MAPBOX API] Route has insufficient coordinates: {len(coordinates)}")
+                            return None
+                        
+                        # Convert from [lng, lat] to [lat, lng] for frontend
+                        # Mapbox returns coordinates as [lng, lat] pairs in GeoJSON format
+                        path_coordinates = []
+                        for coord in coordinates:
+                            if isinstance(coord, list) and len(coord) >= 2:
+                                lng = float(coord[0])
+                                lat = float(coord[1])
+                                # Validate coordinates
+                                if -180 <= lng <= 180 and -90 <= lat <= 90:
+                                    path_coordinates.append([lat, lng])
+                        
+                        if len(path_coordinates) < 2:
+                            print(f"⚠️ [MAPBOX API] Validated path has insufficient coordinates: {len(path_coordinates)}")
+                            return None
+                        
+                        print(f"✅ [MAPBOX API] Route calculated: {len(path_coordinates)} points, {route.get('distance', 0)/1000:.1f}km, {route.get('duration', 0)/60:.1f}min")
+                        
+                        return {
+                            "path": path_coordinates,
+                            "distance": route.get("distance", 0),  # in meters
+                            "duration": route.get("duration", 0),  # in seconds
+                            "geometry": coordinates  # Keep original [lng, lat] format for reference
+                        }
+                    else:
+                        print(f"⚠️ [MAPBOX API] No routes found in response")
+                        return None
+                else:
+                    try:
+                        error_data = json.loads(response_text)
+                        error_msg = error_data.get("message", response_text)
+                    except:
+                        error_msg = response_text
+                    print(f"❌ [MAPBOX API] HTTP {response.status} error: {error_msg}")
+                    return None
+    except Exception as e:
+        print(f"❌ [MAPBOX API] Exception calling API: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 @app.post("/tools/search_restaurants")
@@ -251,33 +367,49 @@ async def update_map(params: dict) -> dict:
         # Generate waypoint coordinates
         waypoint_coords = [wp["coordinates"] for wp in route_coordinates]
         
-        # Calculate bounds from waypoints (start and end locations)
-        # This ensures the map fits the route endpoints properly
-        bounds = _calculate_bounds(waypoint_coords, padding=0.15)  # 15% padding for better view
+        # Try to get route from Mapbox Directions API
+        route_data = await get_route_from_mapbox(waypoint_coords, route_type)
         
-        # Generate intermediate path points for a visible route line
-        # In production, use Mapbox Directions API or similar routing service
-        path_coordinates = []
-        for i in range(len(waypoint_coords)):
-            path_coordinates.append(waypoint_coords[i])
-            # Add intermediate points between waypoints for smoother route visualization
-            if i < len(waypoint_coords) - 1:
-                start = waypoint_coords[i]
-                end = waypoint_coords[i + 1]
-                # Generate 5 intermediate points between start and end
-                for j in range(1, 6):
-                    ratio = j / 6.0
-                    intermediate_lat = start[0] + (end[0] - start[0]) * ratio
-                    intermediate_lng = start[1] + (end[1] - start[1]) * ratio
-                    path_coordinates.append([intermediate_lat, intermediate_lng])
-        
-        return {
-            "route_type": route_type,
-            "waypoints": route_coordinates,
-            "path": path_coordinates,  # Array of [lat, lng] for drawing the route
-            "bounds": bounds,  # Calculated from waypoints with padding
-            "message": f"Route updated with {len(waypoints)} waypoints"
-        }
+        if route_data and route_data.get("path"):
+            # Use real route from Mapbox Directions API
+            path_coordinates = route_data["path"]
+            bounds = _calculate_bounds(path_coordinates, padding=0.15)
+            
+            return {
+                "route_type": route_type,
+                "waypoints": route_coordinates,
+                "path": path_coordinates,  # Array of [lat, lng] from Mapbox
+                "bounds": bounds,
+                "distance": route_data.get("distance", 0),  # in meters
+                "duration": route_data.get("duration", 0),  # in seconds
+                "message": f"Route calculated from Mapbox Directions API with {len(waypoints)} waypoints"
+            }
+        else:
+            # Fallback to simple path if Mapbox API fails or token not available
+            bounds = _calculate_bounds(waypoint_coords, padding=0.15)
+            
+            # Generate simple straight-line path as fallback
+            path_coordinates = []
+            for i in range(len(waypoint_coords)):
+                path_coordinates.append(waypoint_coords[i])
+                # Add intermediate points between waypoints for smoother route visualization
+                if i < len(waypoint_coords) - 1:
+                    start = waypoint_coords[i]
+                    end = waypoint_coords[i + 1]
+                    # Generate 5 intermediate points between start and end
+                    for j in range(1, 6):
+                        ratio = j / 6.0
+                        intermediate_lat = start[0] + (end[0] - start[0]) * ratio
+                        intermediate_lng = start[1] + (end[1] - start[1]) * ratio
+                        path_coordinates.append([intermediate_lat, intermediate_lng])
+            
+            return {
+                "route_type": route_type,
+                "waypoints": route_coordinates,
+                "path": path_coordinates,  # Array of [lat, lng] for drawing the route
+                "bounds": bounds,
+                "message": f"Route updated with {len(waypoints)} waypoints (fallback path)"
+            }
     
     # If only description provided, try to extract locations (simplified)
     # In production, use NLP to extract locations from description

@@ -49,20 +49,32 @@ load_dotenv()
 SYSTEM_PROMPT = """You are the NomadSync Travel Concierge. You are a participant in a live video call. Your goal is to help users plan a trip by using your tools.
 
 CRITICAL ROUTE PLANNING WORKFLOW:
-When a user mentions wanting to travel somewhere (e.g., "I want to go to San Francisco", "Let's go to LA", "Plan a trip to New York"):
-1. FIRST: Ask the user for their CURRENT LOCATION or starting point. Say something like "Where are you starting from?" or "What's your current location?"
-2. WAIT for the user to provide their current location
-3. ONCE you have BOTH the starting location AND destination, IMMEDIATELY call the update_map tool with:
-   - waypoints: [current_location, destination] (as an array of location names)
-   - route_type: "driving" (default)
-   - route_description: Brief description like "Route from [start] to [destination]"
-4. The update_map tool will automatically:
-   - Calculate the route path
-   - Center the map on the route
-   - Display the route line on the map
-   - Show waypoint markers
+When a user mentions wanting to travel somewhere, extract locations from their natural language:
 
-IMPORTANT: Do NOT call update_map until you have BOTH the starting location AND destination. Always ask for current location first.
+1. If they provide BOTH start and destination in one message (e.g., "plan a trip from oakland to berkeley", "route from san francisco to los angeles"):
+   - Extract both location names from the message
+   - IMMEDIATELY call update_map with waypoints=[start_location, destination_location]
+   - Example: If user says "plan me a trip from oakland to berkeley", call update_map(waypoints=["Oakland", "Berkeley"])
+
+2. If they only mention a destination (e.g., "I want to go to San Francisco"):
+   - Ask for their current location first
+   - Once you have both, call update_map with waypoints=[current_location, destination]
+
+3. Always pass waypoints as an array of location name strings (e.g., ["Oakland", "Berkeley"])
+   - Extract location names naturally from the conversation
+   - Don't use hardcoded coordinates - use location names
+   - The tool will automatically look up coordinates
+
+4. The update_map tool will automatically:
+   - Look up coordinates for each location name
+   - Calculate the route path using Mapbox Directions API
+   - Display the route as a continuous line on the map
+   - Show start and end waypoint markers
+
+IMPORTANT: 
+- Extract location names from natural language - be smart about parsing phrases
+- Always use location names (strings), not coordinates
+- The tool handles coordinate lookup automatically
 
 Be Proactive: If users mention a city or destination, look up restaurants and activities immediately.
 
@@ -70,7 +82,7 @@ Multi-Modal: When you find a place, tell the users about it verbally while simul
 
 Financial Steward: Always confirm the price in SOL before generating a Solana payment transaction.
 
-Tone: Helpful, enthusiastic, and concise. Always ask for the user's current location when planning a route."""
+Tone: Helpful, enthusiastic, and concise."""
 
 
 class NomadSyncAgent(Agent):
@@ -113,169 +125,59 @@ class NomadSyncAgent(Agent):
         
     async def on_enter(self):
         """Called when agent becomes active"""
-        print(f"🤖 [AGENT ENTER] NomadSync Agent activated")
+        print("🤖 NomadSync Agent activated")
         
-        # Access session (read-only property set by AgentSession)
-        # self.session is available after session.start() is called
         try:
-            if not hasattr(self, 'session') or not self.session:
-                print(f"   ⚠️  WARNING: Session not available in on_enter!")
-                return
+            # Get room reference
+            room = self._room
+            if hasattr(self, 'session') and self.session:
+                try:
+                    room = self.session.room if hasattr(self.session, 'room') else self._room
+                except:
+                    pass
             
-            # Try to get room from session, or use stored reference
-            try:
-                room = self.session.room if hasattr(self.session, 'room') else self._room
-            except:
-                room = self._room
+            if room:
+                self._room = room
+                print(f"   Room: {room.name}")
             
-            if not room:
-                print(f"   ⚠️  [WARNING] Room not available in on_enter!")
-                return
-            
-            # Store room reference for later use
-            self._room = room
-            
-            agent_participant = room.local_participant if hasattr(room, 'local_participant') else None
-            
-            print(f"   Room: {room.name}")
-            print(f"   Agent participant: {agent_participant.identity if agent_participant else 'N/A'}")
-            print(f"   Agent kind: {agent_participant.kind if agent_participant else 'N/A'}")
-            print(f"   Agent name: {getattr(agent_participant, 'name', 'N/A') if agent_participant else 'N/A'}")
-            
-            # Verify audio tracks are set up
-            if agent_participant:
-                audio_tracks = [pub for pub in agent_participant.track_publications.values() if pub.kind == rtc.TrackKind.KIND_AUDIO]
-                print(f"   🔊 Audio tracks: {len(audio_tracks)}")
-                for track in audio_tracks:
-                    print(f"      - {track.track_name}: {track.source}, muted={track.muted}")
-            
-            # Ensure agent is visible by publishing a silent audio track if needed
-            # AgentSession should handle this, but we can verify
-            if agent_participant:
-                audio_tracks = list(agent_participant.audio_track_publications.values())
-                print(f"   Audio tracks: {len(audio_tracks)}")
-                for track_pub in audio_tracks:
-                    print(f"      - {track_pub.track_sid}: {track_pub.track}")
-            
-            # Initialize MCP client
+            # Initialize MCP client for tool calls
             try:
                 from mcp_client import MCPClient
-                print(f"   🔌 [MCP] Initializing MCP client...")
+                print("   🔌 Connecting to MCP server...")
                 self.mcp_client = MCPClient()
-                print(f"   🔌 [MCP] Connecting to MCP server...")
                 await self.mcp_client.connect()
-                print(f"   ✅ [MCP] MCP client connected successfully")
+                print("   ✅ MCP client connected")
             except Exception as e:
-                print(f"   ❌ [ERROR] Failed to connect MCP client: {e}")
-                print(f"   ⚠️  [WARNING] Tools that require MCP server will fail")
-                print(f"   💡 [TIP] Make sure MCP server is running: python mcp_server.py")
-                import traceback
-                traceback.print_exc()
+                print(f"   ⚠️ MCP client failed: {e} (tools may not work)")
                 self.mcp_client = None
             
-            # Store room reference for data publishing (no need to create data channel)
-            self._room = room
-            print(f"   ✅ Room reference stored for data publishing")
-            
-            # Generate initial greeting using session
-            try:
-                await self.session.generate_reply(
-                    instructions="Greet the user warmly and say you're ready to help plan their trip"
-                )
-                print(f"   ✅ Initial greeting sent")
-            except Exception as e:
-                print(f"   ⚠️ Could not send initial greeting: {e}")
-                import traceback
-                traceback.print_exc()
-        except AttributeError as e:
-            print(f"   ⚠️ [WARNING] Session not available yet: {e}")
+            # Send initial greeting
+            if hasattr(self, 'session') and self.session:
+                try:
+                    await self.session.generate_reply(
+                        instructions="Greet the user warmly and say you're ready to help plan their trip"
+                    )
+                    print("   ✅ Initial greeting sent")
+                except Exception as e:
+                    print(f"   ⚠️ Could not send greeting: {e}")
+                    
         except Exception as e:
-            print(f"   ❌ [ERROR] Error in on_enter: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"   ❌ Error in on_enter: {e}")
     
     async def on_user_turn_completed(self, turn_ctx, new_message):
-        """Called after user speaks, before LLM generates response"""
+        """Called after user speaks - AgentSession handles LLM response automatically"""
         message = new_message.text_content if hasattr(new_message, 'text_content') else str(new_message)
         
-        # Log that agent heard the user
-        print("=" * 60)
-        print(f"🎧 [AGENT HEARD] User said: '{message}'")
-        print("=" * 60)
+        # Simple log of what user said
+        print(f"🎧 [HEARD] \"{message}\"")
         
-        # Analyze the message to detect route planning intent
+        # Detect if this looks like a route planning request
         message_lower = message.lower()
-        route_keywords = ["go to", "travel to", "drive to", "trip to", "visit", "head to", "route to", "plan a trip"]
-        destination_keywords = ["san francisco", "sf", "los angeles", "la", "new york", "nyc", "chicago", "miami", "seattle"]
+        if any(kw in message_lower for kw in ["go to", "trip to", "route", "travel", "drive to", "from", "to"]):
+            print(f"   📍 Route intent detected - agent should call update_map tool")
         
-        has_route_intent = any(keyword in message_lower for keyword in route_keywords)
-        has_destination = any(keyword in message_lower for keyword in destination_keywords)
-        
-        print(f"   🔍 [INTENT ANALYSIS]")
-        print(f"      Route planning intent: {has_route_intent}")
-        print(f"      Destination detected: {has_destination}")
-        
-        if has_route_intent or has_destination:
-            print(f"   📍 [ROUTE DETECTED] Agent should:")
-            print(f"      1. Ask for current location (if not provided)")
-            print(f"      2. Call update_map tool with waypoints: [current_location, destination]")
-            print(f"      3. Display route on mapbox")
-        
-        print(f"   🤔 [AGENT THINKING] Processing transcript and planning response...")
-        print(f"   💡 [EXPECTED BEHAVIOR] AgentSession will:")
-        print(f"      - Analyze the message with Claude LLM")
-        print(f"      - Decide if tools need to be called")
-        print(f"      - Call appropriate tools (e.g., update_map for routes)")
-        print(f"      - Generate verbal response")
-        
-        # Check if session is available
-        try:
-            if hasattr(self, 'session') and self.session:
-                print(f"   ✅ Session available: {type(self.session)}")
-                print(f"      Session state: {getattr(self.session, '_state', 'unknown')}")
-            else:
-                print(f"   ⚠️  WARNING: Session not available! Agent may not respond.")
-                print(f"      Session attribute: {getattr(self, 'session', 'NOT FOUND')}")
-                print(f"      This is normal - session is set by AgentSession.start()")
-        except Exception as e:
-            print(f"   ❌ ERROR checking session: {e}")
-        
-        # CRITICAL: According to LiveKit Agents docs, on_user_turn_completed doesn't auto-trigger response
-        # We need to manually call session.generate_reply() to make the agent respond and call tools
-        print(f"   🚀 [TRIGGERING RESPONSE] Calling session.generate_reply() to trigger LLM response...")
-        
-        try:
-            if hasattr(self, 'session') and self.session:
-                print(f"   ✅ Session available, triggering LLM response with user input...")
-                print(f"   📝 [LLM CALL] Sending to LLM: '{message}'")
-                
-                # Use generate_reply with user_input to trigger LLM response and tool calling
-                # This will:
-                # 1. Add user input to chat history
-                # 2. Call LLM with the message
-                # 3. LLM decides if tools need to be called
-                # 4. Execute tools if needed (like update_map)
-                # 5. Generate response text
-                # 6. Send response via TTS
-                speech_handle = await self.session.generate_reply(
-                    user_input=message,  # This triggers LLM and tool calling
-                    allow_interruptions=True
-                )
-                
-                print(f"   ✅ [SUCCESS] Response triggered! SpeechHandle: {speech_handle}")
-                print(f"   🎤 [TTS] Response should be spoken via TTS now")
-                print(f"   🧠 [LLM] LLM will analyze and decide if tools need to be called")
-                print(f"   📝 [NOTE] Watch for '💬 [LLM RESPONSE]' log to see what the agent wants to say")
-                
-            else:
-                print(f"   ❌ [ERROR] Session not available - cannot trigger response!")
-                print(f"      Session attribute: {getattr(self, 'session', 'NOT FOUND')}")
-        except Exception as e:
-            print(f"   ❌ [ERROR] Failed to trigger response: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        print("=" * 60)
+        # NOTE: AgentSession automatically triggers LLM response after user turn
+        # No need to manually call generate_reply() - the session handles this
     
     @function_tool
     async def search_restaurants(self, context: RunContext, location: str, food_type: str = "") -> dict:
@@ -285,6 +187,7 @@ class NomadSyncAgent(Agent):
             location: City or location name
             food_type: Type of cuisine or food (optional)
         """
+        print(f"🔧 [TOOL] search_restaurants(location={location}, food_type={food_type})")
         await self._update_thinking_state(
             f"Searching for restaurants in {location}...",
             tool_name="search_restaurants"
@@ -311,6 +214,7 @@ class NomadSyncAgent(Agent):
         Args:
             location: City or location name
         """
+        print(f"🔧 [TOOL] get_activities(location={location})")
         await self._update_thinking_state(
             f"Finding activities in {location}...",
             tool_name="get_activities"
@@ -402,7 +306,13 @@ class NomadSyncAgent(Agent):
             route_description: Description of the route or trip plan if waypoints are not clear
             route_type: Type of route: 'driving', 'walking', or 'transit'
         """
-        # Update thinking state to show what agent is doing
+        print("=" * 60)
+        print(f"🔧 [TOOL] update_map called!")
+        print(f"   Waypoints: {waypoints}")
+        print(f"   Route type: {route_type}")
+        print("=" * 60)
+        
+        # Update thinking state to show what agent is doing in frontend
         if waypoints and len(waypoints) >= 2:
             await self._update_thinking_state(
                 f"Planning route from {waypoints[0]} to {waypoints[-1]}...",
@@ -580,7 +490,7 @@ class NomadSyncAgent(Agent):
     async def _broadcast_route_update(self, route_data: dict):
         """Broadcast route update to map via LiveKit data publishing"""
         if not route_data:
-            print("   ⚠️ No route data to broadcast")
+            print("   ⚠️ [ROUTE BROADCAST] No route data to broadcast")
             return
         
         # Ensure route_data has the structure frontend expects
@@ -588,6 +498,14 @@ class NomadSyncAgent(Agent):
         path = route_data.get("path", [])
         waypoints = route_data.get("waypoints", [])
         bounds = route_data.get("bounds", {})
+        
+        print(f"   📤 [ROUTE BROADCAST] Preparing route update:")
+        print(f"      Path points: {len(path)}")
+        print(f"      Waypoints: {len(waypoints)}")
+        print(f"      Has bounds: {bool(bounds)}")
+        if path and len(path) > 0:
+            print(f"      First path point: {path[0]}")
+            print(f"      Last path point: {path[-1]}")
         
         # Ensure path is in correct format: array of [lat, lng] arrays
         if path and len(path) > 0:
@@ -619,236 +537,128 @@ class NomadSyncAgent(Agent):
 
 
 async def entrypoint(ctx: JobContext):
-    """Entry point for the LiveKit agent"""
+    """Entry point for the LiveKit agent - STANDARD PATTERN"""
     print("=" * 60)
-    print("🚀 [ENTRYPOINT] Starting NomadSync Agent...")
+    print("🚀 NomadSync Agent Starting...")
     print("=" * 60)
     
     try:
-        # Connect to the room first (required)
-        print("📡 [ENTRYPOINT] Connecting to LiveKit room...")
-        await ctx.connect()
+        # Connect to room with auto-subscribe to audio
+        print("📡 Connecting to LiveKit room...")
+        await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
         print(f"   ✅ Connected to room: {ctx.room.name}")
         print(f"   Agent identity: {ctx.agent.identity}")
-        print(f"   Agent kind: {ctx.agent.kind}")
-        
-        # Set agent name and metadata for frontend identification
-        # The agent must have a name/identity that contains "agent" for frontend detection
-        try:
-            # Update metadata with agent name
-            metadata = json.dumps({"name": "NomadSync Agent", "type": "agent"})
-            ctx.agent.update_metadata(metadata)
-            print("   ✅ Agent metadata set: NomadSync Agent")
-        except Exception as e:
-            print(f"   ⚠️ Note: Could not set agent metadata: {e}")
-            # Try alternative method
-            try:
-                if hasattr(ctx.agent, 'set_name'):
-                    ctx.agent.set_name("NomadSync Agent")
-                    print("   ✅ Agent name set via set_name()")
-            except:
-                pass
-        
-        # Log participant info for debugging
-        print(f"   📊 Agent participant info:")
-        print(f"      - Identity: {ctx.agent.identity}")
-        print(f"      - Name: {getattr(ctx.agent, 'name', 'N/A')}")
-        print(f"      - Kind: {ctx.agent.kind}")
-        print(f"      - SID: {ctx.agent.sid}")
         
         # Configure STT
-        print("🎤 [ENTRYPOINT] Configuring Deepgram STT...")
+        print("🎤 Configuring Deepgram STT...")
         stt = DeepgramSTT(
             api_key=os.getenv("DEEPGRAM_API_KEY"),
             model="nova-2",
             language="en-US",
             smart_format=True,
         )
-        print("   ✅ STT configured")
         
         # Configure TTS
-        print("🔊 [ENTRYPOINT] Configuring Deepgram TTS...")
-        tts = DeepgramTTS(
-            api_key=os.getenv("DEEPGRAM_API_KEY"),
-        )
-        print("   ✅ TTS configured")
+        print("🔊 Configuring Deepgram TTS...")
+        tts = DeepgramTTS(api_key=os.getenv("DEEPGRAM_API_KEY"))
         
         # Configure VAD
-        print("👂 [ENTRYPOINT] Loading Silero VAD...")
+        print("👂 Loading Silero VAD...")
         vad = silero.VAD.load()
-        print("   ✅ VAD loaded")
         
-        # Configure LLM (OpenAI or Anthropic)
-        print("🧠 [ENTRYPOINT] Configuring LLM...")
-        llm_provider = os.getenv("LLM_PROVIDER", "anthropic").lower().strip()  # Default to Anthropic (Claude)
-        print(f"   📋 LLM Provider: '{llm_provider}' (from env: {os.getenv('LLM_PROVIDER', 'not set, using default: anthropic')})")
+        # Configure LLM
+        print("🧠 Configuring LLM...")
+        llm_provider = os.getenv("LLM_PROVIDER", "anthropic").lower().strip()
         
         if llm_provider == "anthropic" or llm_provider == "":
             anthropic_key = os.getenv("ANTHROPIC_API_KEY")
             if not anthropic_key:
-                raise ValueError(
-                    "ANTHROPIC_API_KEY not found in environment variables.\n"
-                    "Please set it in your .env file:\n"
-                    "  ANTHROPIC_API_KEY=your_key_here\n"
-                    "Get your key from: https://console.anthropic.com/"
-                )
-            # Use Claude Sonnet 4.5 - best model for real-world agents and coding
-            # Alternative: "claude-3-7-sonnet-20250219" for high-performance with extended thinking
+                raise ValueError("ANTHROPIC_API_KEY not found in environment variables.")
             llm_instance = anthropic.LLM(
-                model="claude-sonnet-4-5-20250929",  # Best for agents and coding
+                model="claude-sonnet-4-5-20250929",
                 api_key=anthropic_key,
             )
-            print("   ✅ Anthropic LLM (Claude Sonnet 4.5) configured")
-            print(f"   🔑 API Key: {'*' * 20}{anthropic_key[-4:] if len(anthropic_key) > 4 else '****'}")
+            print("   ✅ Using Anthropic Claude Sonnet 4.5")
         elif llm_provider == "openai":
             openai_key = os.getenv("OPENAI_API_KEY")
             if not openai_key:
-                raise ValueError("OPENAI_API_KEY not found in environment variables. Please set it in .env file.")
-            llm_instance = openai.LLM(
-                model="gpt-4o",
-                api_key=openai_key,
-            )
-            print("   ✅ OpenAI LLM (GPT-4o) configured")
+                raise ValueError("OPENAI_API_KEY not found in environment variables.")
+            llm_instance = openai.LLM(model="gpt-4o", api_key=openai_key)
+            print("   ✅ Using OpenAI GPT-4o")
         else:
-            raise ValueError(f"Invalid LLM_PROVIDER: '{llm_provider}'. Must be 'anthropic' or 'openai'")
+            raise ValueError(f"Invalid LLM_PROVIDER: '{llm_provider}'")
         
-        # Create the agent instance
-        print("🤖 [ENTRYPOINT] Creating NomadSyncAgent instance...")
-        # Don't pass tools here - let __init__ handle it to avoid duplicates
-        agent = NomadSyncAgent(
-            instructions=SYSTEM_PROMPT,
-        )
-        # Store room reference in agent for data channel creation
+        # Create agent
+        print("🤖 Creating NomadSyncAgent...")
+        agent = NomadSyncAgent(instructions=SYSTEM_PROMPT)
         agent._room = ctx.room
-        print("   ✅ Agent instance created")
-        print(f"   📍 Room reference stored in agent: {ctx.room.name}")
         
-        # Debug: Check if tools are registered
-        if hasattr(agent, 'tools'):
-            tool_names = [getattr(t, '__name__', str(t)) for t in (agent.tools or [])]
-            print(f"   🔧 Tools registered: {len(tool_names)} - {tool_names}")
+        # Create session
+        print("📋 Creating AgentSession...")
+        session = AgentSession(vad=vad, stt=stt, llm=llm_instance, tts=tts)
         
-        # Create AgentSession with STT, LLM, TTS, VAD
-        print("📋 [ENTRYPOINT] Creating AgentSession...")
-        session = AgentSession(
-            vad=vad,
-            stt=stt,
-            llm=llm_instance,
-            tts=tts,
-        )
-        print("   ✅ AgentSession created")
-        
-        # Set up event handler to capture LLM-generated responses
+        # Log conversation items
         @session.on("conversation_item_added")
         def on_conversation_item_added(event: ConversationItemAddedEvent):
-            """Capture and log LLM-generated responses"""
             role = event.item.role
-            text_content = event.item.text_content
-            interrupted = event.item.interrupted
-            
-            if role == "assistant":
-                print("=" * 60)
-                print(f"💬 [LLM RESPONSE] Agent wants to say:")
-                print(f"   '{text_content}'")
-                print(f"   Interrupted: {interrupted}")
-                print("=" * 60)
-                
-                # Also log the intent/action
-                text_lower = text_content.lower()
-                if "update_map" in text_lower or "route" in text_lower or "map" in text_lower:
-                    print(f"   🗺️  [INTENT] Response mentions route/map - update_map tool may be called")
-                if "location" in text_lower or "where are you" in text_lower or "where are you starting" in text_lower:
-                    print(f"   📍 [INTENT] Response asks for location")
-                if "san francisco" in text_lower or "sf" in text_lower:
-                    print(f"   🎯 [INTENT] Response mentions San Francisco")
-            elif role == "user":
-                print(f"👤 [USER MESSAGE LOGGED] User said: '{text_content}'")
+            text = event.item.text_content
+            if role == "user":
+                print(f"👤 [USER] \"{text}\"")
+            elif role == "assistant":
+                print(f"🤖 [AGENT] \"{text}\"")
         
-        # Set up event handler for agent state changes (thinking, speaking, etc.)
+        # Broadcast agent state to frontend
         @session.on("agent_state_changed")
         def on_agent_state_changed(event: AgentStateChangedEvent):
-            """Track and broadcast agent state changes to frontend"""
-            new_state = event.new_state
+            state = event.new_state
+            print(f"🔄 [STATE] {state}")
             
-            # Determine thinking message based on state
-            thinking_message = None
-            if new_state == "thinking":
-                thinking_message = "Analyzing your request and generating a response..."
-            elif new_state == "listening":
-                thinking_message = "Listening for your input..."
-            elif new_state == "speaking":
-                thinking_message = "Speaking to you..."
-            elif new_state == "idle":
-                thinking_message = None  # Clear thinking state
-            
-            # Broadcast state to frontend (use asyncio.create_task for async operations)
-            async def broadcast_state():
+            async def broadcast():
                 try:
-                    state_update = {
+                    await agent._send_data_message({
                         "type": "AGENT_STATE",
-                        "state": new_state,
-                        "thinking_message": thinking_message
-                    }
-                    await agent._send_data_message(state_update)
-                except Exception:
-                    pass  # Silently fail
+                        "state": state,
+                        "thinking_message": f"Agent is {state}..." if state != "idle" else None
+                    })
+                except:
+                    pass
             
-            # Use asyncio.create_task to handle async operations in sync callback
             try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(broadcast_state())
-            except RuntimeError:
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        loop.create_task(broadcast_state())
-                    else:
-                        asyncio.ensure_future(broadcast_state())
-                except RuntimeError:
-                    asyncio.ensure_future(broadcast_state())
+                asyncio.get_running_loop().create_task(broadcast())
+            except:
+                pass
         
-        # Also track when tools are being called to update thinking message
-        # This will be handled in the tool methods themselves
-        
-        print("   ✅ Conversation event handler registered - will log LLM responses")
-        print("   ✅ Agent state change handler registered - will broadcast thinking state")
-        
-        # Note: agent.session is a read-only property that will be set automatically
-        # when session.start() is called - don't try to set it manually
-        
-        # Start the agent session in the room with room options
-        print("=" * 60)
-        print("🚀 [ENTRYPOINT] Starting agent session in room...")
-        print("=" * 60)
-        
-        # Use room_io options to ensure agent is visible and publishes audio
+        # Start session - AgentSession handles audio subscription automatically
+        print("🚀 Starting agent session...")
         await session.start(
             agent=agent,
             room=ctx.room,
             room_options=room_io.RoomOptions(
                 audio_input=room_io.AudioInputOptions(),
-                text_output=room_io.TextOutputOptions(
-                    sync_transcription=True  # Enable transcription for visibility
-                ),
             ),
         )
         
         print("=" * 60)
-        print("✅ [ENTRYPOINT] Agent started successfully!")
-        print(f"   Agent is now in room: {ctx.room.name}")
-        print(f"   Agent identity: {ctx.agent.identity}")
-        print(f"   Agent should be visible to participants")
+        print("✅ Agent is ready and listening!")
+        print(f"   Room: {ctx.room.name}")
+        print(f"   Say something to interact with the agent.")
         print("=" * 60)
         
     except Exception as e:
-        print("=" * 60)
-        print(f"❌ [ENTRYPOINT ERROR] Failed to start agent: {e}")
-        print("=" * 60)
+        print(f"❌ [ERROR] {e}")
         import traceback
         traceback.print_exc()
         raise
 
 
 if __name__ == "__main__":
+    print("=" * 60)
+    print("🔧 [MAIN] Starting agent worker...")
+    print("=" * 60)
+    print("   Entrypoint function: entrypoint")
+    print("   Worker will wait for job assignments...")
+    print("   Make sure to join a room from the frontend to trigger the agent!")
+    print("=" * 60)
+    
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
 
