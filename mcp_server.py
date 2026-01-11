@@ -14,9 +14,10 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-# Mapbox Directions API configuration
+# Mapbox API configuration
 MAPBOX_ACCESS_TOKEN = os.getenv("MAPBOX_ACCESS_TOKEN") or os.getenv("NEXT_PUBLIC_MAPBOX_TOKEN")
 MAPBOX_DIRECTIONS_API = "https://api.mapbox.com/directions/v5"
+MAPBOX_GEOCODING_API = "https://api.mapbox.com/geocoding/v5/mapbox.places"
 
 # Log whether Mapbox token is configured
 if MAPBOX_ACCESS_TOKEN:
@@ -43,71 +44,68 @@ class HotelSearchParams(BaseModel):
     budget_sol: Optional[float] = 0.0
 
 
-# Helper function to get coordinates from location (mock for now)
+# Cache for geocoded locations to avoid repeated API calls
+_geocode_cache: dict[str, tuple[float, float]] = {}
+
 async def get_location_coordinates(location: str) -> tuple[float, float]:
-    """Get lat/lng coordinates for a location (mock implementation)"""
-    # In production, use a geocoding service like Google Maps Geocoding API or Mapbox Geocoding
-    # For now, return mock coordinates for major cities and SF neighborhoods
-    city_coords = {
-        # Major cities
-        "san francisco": (37.7749, -122.4194),
-        "santa barbara": (34.4208, -119.6982),
-        "san diego": (32.7157, -117.1611),
-        "new york": (40.7128, -74.0060),
-        "los angeles": (34.0522, -118.2437),
-        "chicago": (41.8781, -87.6298),
-        "miami": (25.7617, -80.1918),
-        "paris": (48.8566, 2.3522),
-        "london": (51.5074, -0.1278),
-        "tokyo": (35.6762, 139.6503),
-        "oakland": (37.8044, -122.2712),
-        "berkeley": (37.8715, -122.2730),
-        "palo alto": (37.4419, -122.1430),
-        "san jose": (37.3382, -121.8863),
-        "sacramento": (38.5816, -121.4944),
-        # San Francisco neighborhoods
-        "noe valley": (37.7502, -122.4337),
-        "mission district": (37.7599, -122.4148),
-        "mission": (37.7599, -122.4148),
-        "castro": (37.7609, -122.4350),
-        "haight": (37.7692, -122.4481),
-        "haight-ashbury": (37.7692, -122.4481),
-        "soma": (37.7785, -122.3950),
-        "south of market": (37.7785, -122.3950),
-        "marina": (37.8025, -122.4382),
-        "north beach": (37.8061, -122.4103),
-        "chinatown": (37.7941, -122.4078),
-        "financial district": (37.7946, -122.3999),
-        "fisherman's wharf": (37.8080, -122.4177),
-        "fishermans wharf": (37.8080, -122.4177),
-        "embarcadero": (37.7993, -122.3947),
-        "union square": (37.7879, -122.4074),
-        "tenderloin": (37.7847, -122.4141),
-        "pacific heights": (37.7925, -122.4382),
-        "russian hill": (37.8011, -122.4194),
-        "sunset": (37.7603, -122.4952),
-        "richmond": (37.7803, -122.4837),
-        "golden gate park": (37.7694, -122.4862),
-        "presidio": (37.7989, -122.4662),
-        "potrero hill": (37.7576, -122.4005),
-        "dogpatch": (37.7616, -122.3877),
-        "bernal heights": (37.7388, -122.4156),
-        # Oakland neighborhoods
-        "downtown oakland": (37.8044, -122.2712),
-        "lake merritt": (37.8027, -122.2601),
-        "rockridge": (37.8430, -122.2517),
-        "temescal": (37.8364, -122.2600),
-        "jack london square": (37.7952, -122.2761),
-    }
+    """
+    Get lat/lng coordinates for a location using Mapbox Geocoding API.
+    Works with ANY location worldwide!
+    """
+    location_lower = location.lower().strip()
     
-    location_lower = location.lower()
-    for city, coords in city_coords.items():
-        if city in location_lower:
-            print(f"📍 [GEOCODE] Found '{city}' in '{location}' -> {coords}")
-            return coords
+    # Check cache first
+    if location_lower in _geocode_cache:
+        coords = _geocode_cache[location_lower]
+        print(f"📍 [GEOCODE] Cache hit: '{location}' -> {coords}")
+        return coords
     
-    # Default to San Francisco if not found
-    print(f"⚠️ [GEOCODE] Location '{location}' not found in database, using San Francisco default")
+    # Use Mapbox Geocoding API
+    if not MAPBOX_ACCESS_TOKEN:
+        print(f"⚠️ [GEOCODE] No Mapbox token - cannot geocode '{location}'")
+        return (37.7749, -122.4194)  # Default to SF
+    
+    try:
+        # URL encode the location
+        import urllib.parse
+        encoded_location = urllib.parse.quote(location)
+        
+        url = f"{MAPBOX_GEOCODING_API}/{encoded_location}.json"
+        params = {
+            "access_token": MAPBOX_ACCESS_TOKEN,
+            "limit": 1,  # Only need the top result
+            "types": "place,locality,neighborhood,address,poi"  # Prioritize places
+        }
+        
+        print(f"🔍 [GEOCODE] Looking up: '{location}'...")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if data.get("features") and len(data["features"]) > 0:
+                        feature = data["features"][0]
+                        # Mapbox returns [longitude, latitude]
+                        lng, lat = feature["geometry"]["coordinates"]
+                        place_name = feature.get("place_name", location)
+                        
+                        coords = (lat, lng)
+                        _geocode_cache[location_lower] = coords
+                        
+                        print(f"✅ [GEOCODE] Found: '{location}' -> '{place_name}' -> ({lat}, {lng})")
+                        return coords
+                    else:
+                        print(f"⚠️ [GEOCODE] No results for '{location}'")
+                else:
+                    error_text = await response.text()
+                    print(f"❌ [GEOCODE] API error {response.status}: {error_text[:200]}")
+                    
+    except Exception as e:
+        print(f"❌ [GEOCODE] Error geocoding '{location}': {e}")
+    
+    # Fallback to San Francisco if geocoding fails
+    print(f"⚠️ [GEOCODE] Using San Francisco as fallback for '{location}'")
     return (37.7749, -122.4194)
 
 
