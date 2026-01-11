@@ -524,26 +524,35 @@ class NomadSyncAgent(Agent):
         """Generate a Solana payment request for booking. This sends a request to the frontend
         and waits for user to verbally confirm before executing.
 
+        The displayed amount is the calculated itinerary total, but for devnet demo purposes,
+        the actual charge is a flat 0.1 SOL.
+
         Args:
-            amount_usd: Amount in USD
-            item_description: Description of what the payment is for
+            amount_usd: Total estimated cost in USD (sum of all itinerary items)
+            item_description: Description of what the payment is for (e.g., "Trip to San Francisco - 2 nights hotel + 3 restaurants + 2 activities")
         """
         print(f"🔧 [TOOL CALL] Calling 'generate_booking_payment' tool")
-        print(f"   Amount: ${amount_usd} USD, Item: {item_description}")
+        print(f"   Itinerary Total: ${amount_usd} USD")
+        print(f"   Items: {item_description}")
+        print(f"   Demo Charge: 0.1 SOL (devnet)")
 
         try:
             # Send payment request to frontend (waits for voice confirmation)
+            # Shows calculated total but charges flat 0.1 SOL for demo
             transaction_data = {
                 "amount_usd": amount_usd,
                 "amount_sol": 0.1,  # Fixed 0.1 SOL for devnet demo
                 "item_description": item_description,
+                "is_demo": True,
+                "demo_note": "Devnet demo - actual charge is 0.1 SOL"
             }
             await self._send_payment_transaction(transaction_data)
             print(f"   ✅ [SUCCESS] Payment request sent to frontend")
             return {
                 "status": "pending_confirmation",
-                "message": f"Payment request for ${amount_usd} sent. Waiting for user confirmation.",
+                "message": f"Payment request for ${amount_usd:.2f} sent. Waiting for user confirmation. (Demo: 0.1 SOL)",
                 "amount_usd": amount_usd,
+                "amount_sol": 0.1,
                 "item_description": item_description
             }
         except Exception as e:
@@ -876,26 +885,62 @@ class NomadSyncAgent(Agent):
         except Exception as e:
             return False
     
-    def _estimate_cost_from_price_tier(self, price_tier: str, item_type: str, location: str = "") -> int:
-        """Estimate cost based on Yelp price tier ($-$$$$) and item type"""
-        # Base prices for each tier
-        base_prices = {
-            "restaurant": {"$": 15, "$$": 30, "$$$": 55, "$$$$": 100},
-            "hotel": {"$": 100, "$$": 180, "$$$": 300, "$$$$": 500},
-            "activity": {"$": 20, "$$": 50, "$$$": 100, "$$$$": 200},
+    def _estimate_cost_from_price_tier(self, price_tier: str, item_type: str, location: str = "", item_name: str = "") -> int:
+        """Estimate cost based on Yelp price tier ($-$$$$) and item type with realistic randomization"""
+        import random
+
+        # Price ranges for each tier (min, max) - creates realistic variation
+        price_ranges = {
+            "restaurant": {
+                "$": (8, 15),
+                "$$": (16, 30),
+                "$$$": (31, 60),
+                "$$$$": (61, 150),
+            },
+            "hotel": {
+                "$": (60, 120),
+                "$$": (121, 250),
+                "$$$": (251, 450),
+                "$$$$": (451, 800),
+            },
+            "activity": {
+                "Free": (0, 0),
+                "$": (10, 25),
+                "$$": (26, 75),
+                "$$$": (76, 200),
+                "$$$$": (150, 350),
+            },
         }
-        
-        # Location multipliers (expensive cities)
-        expensive_cities = ["san francisco", "sf", "new york", "nyc", "los angeles", "la", 
+
+        # Location multipliers
+        expensive_cities = ["san francisco", "sf", "new york", "nyc", "los angeles", "la",
                           "seattle", "boston", "miami", "chicago", "washington dc", "hawaii"]
+        budget_cities = ["austin", "denver", "portland", "phoenix", "dallas", "atlanta"]
+
         location_lower = location.lower() if location else ""
-        location_multiplier = 1.2 if any(city in location_lower for city in expensive_cities) else 1.0
-        
-        # Get base price
-        tier = price_tier if price_tier in ["$", "$$", "$$$", "$$$$"] else "$$"
-        prices = base_prices.get(item_type, base_prices["restaurant"])
-        base_price = prices.get(tier, prices["$$"])
-        
+        if any(city in location_lower for city in expensive_cities):
+            location_multiplier = 1.15  # +15% for expensive cities
+        elif any(city in location_lower for city in budget_cities):
+            location_multiplier = 0.90  # -10% for budget cities
+        else:
+            location_multiplier = 1.0
+
+        # Get price range for tier
+        tier = price_tier if price_tier in ["$", "$$", "$$$", "$$$$", "Free"] else "$$"
+        ranges = price_ranges.get(item_type, price_ranges["restaurant"])
+        price_range = ranges.get(tier, ranges["$$"])
+
+        # Use item name as seed for consistent pricing per item
+        if item_name:
+            seed = hash(item_name) % 10000
+            random.seed(seed)
+
+        # Generate random price within range
+        base_price = random.randint(price_range[0], price_range[1])
+
+        # Reset random seed
+        random.seed()
+
         # Apply location multiplier and return
         return int(base_price * location_multiplier)
     
@@ -905,31 +950,37 @@ class NomadSyncAgent(Agent):
         num_guests = search_result.get("num_guests", 1)
         num_rooms = search_result.get("num_rooms", 1)
         nights = search_result.get("nights", 1)
-        
+
         # Process restaurants
         if "restaurants" in search_result:
             for r in search_result["restaurants"]:
                 price_tier = r.get("price", "$$")
-                cost_per_person = self._estimate_cost_from_price_tier(price_tier, "restaurant", location)
+                item_name = r.get("name", "")
+                cost_per_person = self._estimate_cost_from_price_tier(price_tier, "restaurant", location, item_name)
                 r["estimated_cost_per_person"] = cost_per_person
                 r["estimated_total"] = cost_per_person * num_guests
-        
+                r["price_display"] = f"${cost_per_person}/person"
+
         # Process hotels
         if "hotels" in search_result:
             for h in search_result["hotels"]:
                 price_tier = h.get("price", "$$")
-                cost_per_night = self._estimate_cost_from_price_tier(price_tier, "hotel", location)
+                item_name = h.get("name", "")
+                cost_per_night = self._estimate_cost_from_price_tier(price_tier, "hotel", location, item_name)
                 h["estimated_cost_per_night"] = cost_per_night
                 h["estimated_total"] = cost_per_night * num_rooms * nights
-        
+                h["price_display"] = f"${cost_per_night}/night"
+
         # Process activities
         if "activities" in search_result:
             for a in search_result["activities"]:
                 price_tier = a.get("price", "$$") if a.get("price") else "$$"
-                cost_per_person = self._estimate_cost_from_price_tier(price_tier, "activity", location)
+                item_name = a.get("name", "")
+                cost_per_person = self._estimate_cost_from_price_tier(price_tier, "activity", location, item_name)
                 a["estimated_cost_per_person"] = cost_per_person
                 a["estimated_total"] = cost_per_person * num_guests
-        
+                a["price_display"] = f"${cost_per_person}/person" if cost_per_person > 0 else "Free"
+
         return search_result
     
     async def _broadcast_map_update(self, search_result: dict):
