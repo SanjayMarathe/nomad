@@ -151,15 +151,25 @@ class NomadSyncAgent(Agent):
                 print(f"   ⚠️ MCP client failed: {e} (tools may not work)")
                 self.mcp_client = None
             
-            # Send initial greeting
+            # Send initial greeting using TTS
             if hasattr(self, 'session') and self.session:
                 try:
-                    await self.session.generate_reply(
-                        instructions="Greet the user warmly and say you're ready to help plan their trip"
+                    # Use session.say() for direct TTS output
+                    print("   🔊 Speaking initial greeting...")
+                    await self.session.say(
+                        "Hello! I'm your NomadSync travel assistant. I'm here to help you plan your next adventure. Where would you like to go today?",
+                        allow_interruptions=True
                     )
-                    print("   ✅ Initial greeting sent")
+                    print("   ✅ Initial greeting spoken")
                 except Exception as e:
-                    print(f"   ⚠️ Could not send greeting: {e}")
+                    print(f"   ⚠️ Could not speak greeting: {e}")
+                    # Fallback to generate_reply
+                    try:
+                        await self.session.generate_reply(
+                            instructions="Greet the user warmly and say you're ready to help plan their trip"
+                        )
+                    except:
+                        pass
                     
         except Exception as e:
             print(f"   ❌ Error in on_enter: {e}")
@@ -168,26 +178,51 @@ class NomadSyncAgent(Agent):
         """Called after user speaks - triggers LLM to respond and potentially call tools"""
         message = new_message.text_content if hasattr(new_message, 'text_content') else str(new_message)
         
-        print(f"🎧 [HEARD] \"{message}\"")
+        print("\n" + "=" * 60)
+        print(f"🎧 [USER TURN COMPLETED]")
+        print(f"   Message: \"{message}\"")
+        print("=" * 60)
         
-        # Detect route planning intent for logging
+        # Detect intent for logging
         message_lower = message.lower()
+        intents_detected = []
+        
         if any(kw in message_lower for kw in ["go to", "trip to", "route", "travel", "drive to", "from", "to", "plan"]):
-            print(f"   📍 Route intent detected - LLM should call update_map tool")
+            intents_detected.append("📍 ROUTE PLANNING (should call update_map)")
+        if any(kw in message_lower for kw in ["restaurant", "food", "eat", "dining", "hungry"]):
+            intents_detected.append("🍽️ RESTAURANTS (should call search_restaurants)")
+        if any(kw in message_lower for kw in ["activity", "things to do", "attraction", "visit", "see"]):
+            intents_detected.append("🎯 ACTIVITIES (should call get_activities)")
+        if any(kw in message_lower for kw in ["hotel", "stay", "accommodation", "lodging", "sleep"]):
+            intents_detected.append("🏨 HOTELS (should call search_hotels)")
+        if any(kw in message_lower for kw in ["book", "pay", "purchase", "buy"]):
+            intents_detected.append("💳 PAYMENT (should call generate_booking_payment)")
+            
+        if intents_detected:
+            print(f"   🎯 Detected intents:")
+            for intent in intents_detected:
+                print(f"      - {intent}")
+        else:
+            print(f"   💬 General conversation (no specific tool intent detected)")
         
         # IMPORTANT: Must call generate_reply() to trigger LLM processing and tool calls
         try:
             if hasattr(self, 'session') and self.session:
-                print(f"   🧠 Triggering LLM response...")
+                print(f"\n   🧠 [LLM] Sending to LLM for processing...")
+                print(f"   🧠 [LLM] Waiting for response (may include tool calls)...")
+                
                 await self.session.generate_reply(
                     user_input=message,
                     allow_interruptions=True
                 )
-                print(f"   ✅ LLM response triggered")
+                
+                print(f"   ✅ [LLM] Response generation complete")
             else:
-                print(f"   ❌ Session not available - cannot respond")
+                print(f"   ❌ [ERROR] Session not available - cannot respond")
         except Exception as e:
-            print(f"   ❌ Error triggering response: {e}")
+            print(f"   ❌ [ERROR] LLM response failed: {e}")
+            import traceback
+            traceback.print_exc()
     
     @function_tool()
     async def search_restaurants(self, context: RunContext, location: str, food_type: str = "") -> dict:
@@ -197,13 +232,19 @@ class NomadSyncAgent(Agent):
             location: City or location name
             food_type: Type of cuisine or food (optional)
         """
-        print(f"🔧 [TOOL] search_restaurants(location={location}, food_type={food_type})")
+        print("\n" + "=" * 60)
+        print(f"🔧 [TOOL CALLED] search_restaurants")
+        print(f"   📍 Location: {location}")
+        print(f"   🍽️ Food Type: {food_type or 'any'}")
+        print("=" * 60)
+        
         await self._update_thinking_state(
             f"Searching for restaurants in {location}...",
             tool_name="search_restaurants"
         )
         
         if not self.mcp_client:
+            print("   ❌ [ERROR] MCP client not initialized")
             return {"error": "MCP client not initialized"}
         
         try:
@@ -212,9 +253,18 @@ class NomadSyncAgent(Agent):
                 location=location,
                 food_type=food_type
             )
+            
+            # Log the result
+            restaurant_count = len(result.get("restaurants", []))
+            print(f"   ✅ [RESULT] Found {restaurant_count} restaurants")
+            if restaurant_count > 0:
+                for i, r in enumerate(result.get("restaurants", [])[:3]):
+                    print(f"      {i+1}. {r.get('name', 'Unknown')} - {r.get('rating', 'N/A')}⭐")
+            
             await self._broadcast_map_update(result)
             return result
         except Exception as e:
+            print(f"   ❌ [ERROR] {e}")
             return {"error": str(e)}
     
     @function_tool()
@@ -568,9 +618,18 @@ async def entrypoint(ctx: JobContext):
             smart_format=True,
         )
         
-        # Configure TTS
+        # Configure TTS with a specific voice model
         print("🔊 Configuring Deepgram TTS...")
-        tts = DeepgramTTS(api_key=os.getenv("DEEPGRAM_API_KEY"))
+        deepgram_key = os.getenv("DEEPGRAM_API_KEY")
+        if not deepgram_key:
+            raise ValueError("DEEPGRAM_API_KEY not found in environment variables!")
+        
+        # Use the plugin TTS class with explicit model
+        from livekit.plugins import deepgram as deepgram_plugin
+        tts = deepgram_plugin.TTS(
+            model="aura-asteria-en",  # Smooth, professional female voice
+        )
+        print("   ✅ TTS model: aura-asteria-en (Deepgram)")
         
         # Configure VAD
         print("👂 Loading Silero VAD...")
@@ -607,21 +666,80 @@ async def entrypoint(ctx: JobContext):
         print("📋 Creating AgentSession...")
         session = AgentSession(vad=vad, stt=stt, llm=llm_instance, tts=tts)
         
-        # Log conversation items
+        # Log conversation items with detailed debugging
         @session.on("conversation_item_added")
         def on_conversation_item_added(event: ConversationItemAddedEvent):
             role = event.item.role
             text = event.item.text_content
+            item = event.item
+            
+            print("=" * 60)
+            print(f"📝 [CONVERSATION ITEM ADDED]")
+            print(f"   Role: {role}")
+            print(f"   Text: \"{text}\"")
+            
+            # Log additional item details
+            if hasattr(item, 'id'):
+                print(f"   Item ID: {item.id}")
+            if hasattr(item, 'type'):
+                print(f"   Type: {item.type}")
+            
+            # Check for tool calls in the item
+            if hasattr(item, 'tool_calls') and item.tool_calls:
+                print(f"   🔧 Tool Calls: {len(item.tool_calls)}")
+                for tc in item.tool_calls:
+                    tc_name = getattr(tc, 'name', None) or getattr(tc, 'function_name', 'unknown')
+                    tc_args = getattr(tc, 'arguments', None) or getattr(tc, 'args', {})
+                    print(f"      - {tc_name}({tc_args})")
+            
+            # Check for function call info
+            if hasattr(item, 'function_call') and item.function_call:
+                fn = item.function_call
+                fn_name = getattr(fn, 'name', 'unknown')
+                fn_args = getattr(fn, 'arguments', {})
+                print(f"   🔧 Function Call: {fn_name}({fn_args})")
+            
             if role == "user":
-                print(f"👤 [USER] \"{text}\"")
+                print(f"👤 [USER MESSAGE] \"{text}\"")
             elif role == "assistant":
-                print(f"🤖 [AGENT] \"{text}\"")
+                print(f"🤖 [AGENT RESPONSE] \"{text}\"")
+            elif role == "tool" or role == "function":
+                print(f"🔧 [TOOL RESULT] {text}")
+            
+            print("=" * 60)
+        
+        # Log when agent starts/stops speaking
+        @session.on("agent_speech_started")
+        def on_agent_speech_started(event):
+            print("\n" + "=" * 60)
+            print("🔊 [AGENT SPEAKING] Started speaking...")
+            print("=" * 60)
+        
+        @session.on("agent_speech_stopped")  
+        def on_agent_speech_stopped(event):
+            print("🔊 [AGENT SPEAKING] Stopped speaking")
+        
+        # Log function/tool calls from the LLM
+        @session.on("function_calls_started")
+        def on_function_calls_started(event):
+            print("\n" + "=" * 60)
+            print("🔧 [LLM TOOL CALLS] Agent is calling tools...")
+            if hasattr(event, 'function_calls'):
+                for fc in event.function_calls:
+                    name = getattr(fc, 'name', 'unknown')
+                    args = getattr(fc, 'arguments', {})
+                    print(f"   - {name}({args})")
+            print("=" * 60)
+        
+        @session.on("function_calls_completed")
+        def on_function_calls_completed(event):
+            print("🔧 [LLM TOOL CALLS] Tool calls completed")
         
         # Broadcast agent state to frontend
         @session.on("agent_state_changed")
         def on_agent_state_changed(event: AgentStateChangedEvent):
             state = event.new_state
-            print(f"🔄 [STATE] {state}")
+            print(f"\n🔄 [AGENT STATE] {state.upper()}")
             
             async def broadcast():
                 try:
@@ -640,19 +758,42 @@ async def entrypoint(ctx: JobContext):
         
         # Start session - AgentSession handles audio subscription automatically
         print("🚀 Starting agent session...")
+        print("   ✅ Audio input: enabled (listening to user)")
+        print("   ✅ Audio output: enabled (agent will speak)")
+        
+        # Configure room options - enable audio input and output
+        room_options = room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(),
+            audio_output=True,  # Enable audio output for TTS
+        )
+        
         await session.start(
             agent=agent,
             room=ctx.room,
-            room_options=room_io.RoomOptions(
-                audio_input=room_io.AudioInputOptions(),
-            ),
+            room_options=room_options,
         )
         
+        print("\n" + "=" * 60)
+        print("✅ AGENT READY - LISTENING FOR SPEECH")
         print("=" * 60)
-        print("✅ Agent is ready and listening!")
         print(f"   Room: {ctx.room.name}")
-        print(f"   Say something to interact with the agent.")
+        print(f"   LLM: {llm_provider.upper()}")
+        print("")
+        print("   📝 DEBUG LOG KEY:")
+        print("   ─────────────────────────────────")
+        print("   🎧 [HEARD]              = User speech detected")
+        print("   🎯 [INTENT]             = Detected user intent")
+        print("   🧠 [LLM]                = LLM processing")
+        print("   🔧 [TOOL CALLED]        = Agent is calling a tool")
+        print("   📝 [CONVERSATION ITEM]  = Message added to conversation")
+        print("   🤖 [AGENT RESPONSE]     = What agent will say")
+        print("   🔊 [SPEAKING]           = Agent is speaking")
+        print("   🔄 [STATE]              = Agent state change")
+        print("   📤 [BROADCAST]          = Sending data to frontend")
         print("=" * 60)
+        print("")
+        print("👂 Waiting for user to speak...")
+        print("")
         
     except Exception as e:
         print(f"❌ [ERROR] {e}")
@@ -667,8 +808,15 @@ if __name__ == "__main__":
     print("=" * 60)
     print("   Entrypoint function: entrypoint")
     print("   Worker will wait for job assignments...")
+    print("   ⚠️  SINGLE AGENT MODE: Only 1 agent per room allowed")
     print("   Make sure to join a room from the frontend to trigger the agent!")
     print("=" * 60)
     
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    # Configure worker to only run 1 agent at a time
+    worker_options = WorkerOptions(
+        entrypoint_fnc=entrypoint,
+        num_idle_processes=1,  # Only keep 1 idle process
+    )
+    
+    cli.run_app(worker_options)
 
