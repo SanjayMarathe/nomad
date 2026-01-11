@@ -197,7 +197,12 @@ Be Proactive: If users mention a city or destination, look up restaurants and ac
 
 Multi-Modal: When you find a place, tell the users about it verbally while simultaneously pushing the coordinates to the map via data messages.
 
-Financial Steward: Always confirm the price in SOL before generating a Solana payment transaction. Wait for verbal confirmation before executing payments.
+Financial Steward: When booking a trip, use generate_booking_payment with separate costs:
+- hotel_cost: Sum of all hotel costs (paid now via Solana)
+- activities_cost: Sum of all activity costs (paid now via Solana)
+- restaurant_cost: Sum of restaurant estimates (pay later at venue)
+Tell user: "Your booking total is $X for hotels and activities. Restaurants ($Y) you'll pay at each venue. Ready to confirm?"
+Wait for verbal confirmation before calling confirm_payment.
 
 Tone: Helpful, enthusiastic, and CONCISE. Keep responses short and to the point."""
 
@@ -520,27 +525,52 @@ class NomadSyncAgent(Agent):
             return {"error": str(e)}
     
     @function_tool()
-    async def generate_booking_payment(self, context: RunContext, amount_usd: float, item_description: str = "booking") -> dict:
-        """Generate a Solana payment request for booking. This sends a request to the frontend
-        and waits for user to verbally confirm before executing.
-
-        The displayed amount is the calculated itinerary total, but for devnet demo purposes,
-        the actual charge is a flat 0.1 SOL.
+    async def generate_booking_payment(
+        self,
+        context: RunContext,
+        hotel_cost: float = 0.0,
+        activities_cost: float = 0.0,
+        restaurant_cost: float = 0.0,
+        item_description: str = "booking"
+    ) -> dict:
+        """Generate a Solana payment request for booking. Only hotels and activities are paid now.
+        Restaurants are shown as expected additional cost to be paid later at the venue.
 
         Args:
-            amount_usd: Total estimated cost in USD (sum of all itinerary items)
-            item_description: Description of what the payment is for (e.g., "Trip to San Francisco - 2 nights hotel + 3 restaurants + 2 activities")
+            hotel_cost: Total cost for hotels (paid now)
+            activities_cost: Total cost for activities (paid now)
+            restaurant_cost: Estimated cost for restaurants (pay later at venue)
+            item_description: Description of the trip/booking
         """
+        # Calculate totals
+        paid_now = hotel_cost + activities_cost
+        pay_later = restaurant_cost
+        estimated_total = paid_now + pay_later
+
         print(f"🔧 [TOOL CALL] Calling 'generate_booking_payment' tool")
-        print(f"   Itinerary Total: ${amount_usd} USD")
-        print(f"   Items: {item_description}")
+        print(f"   📊 Cost Breakdown:")
+        print(f"      Hotels:      ${hotel_cost:.2f}")
+        print(f"      Activities:  ${activities_cost:.2f}")
+        print(f"      ─────────────────────")
+        print(f"      Pay Now:     ${paid_now:.2f}")
+        print(f"      ─────────────────────")
+        print(f"      Restaurants: ${restaurant_cost:.2f} (pay later)")
+        print(f"      ═════════════════════")
+        print(f"      Total Est:   ${estimated_total:.2f}")
         print(f"   Demo Charge: 0.1 SOL (devnet)")
 
         try:
-            # Send payment request to frontend (waits for voice confirmation)
-            # Shows calculated total but charges flat 0.1 SOL for demo
+            # Send payment request to frontend
+            # Only hotels + activities are paid now; restaurants are pay-later
             transaction_data = {
-                "amount_usd": amount_usd,
+                "paid_now_usd": paid_now,
+                "pay_later_usd": pay_later,
+                "estimated_total_usd": estimated_total,
+                "breakdown": {
+                    "hotels": hotel_cost,
+                    "activities": activities_cost,
+                    "restaurants": restaurant_cost
+                },
                 "amount_sol": 0.1,  # Fixed 0.1 SOL for devnet demo
                 "item_description": item_description,
                 "is_demo": True,
@@ -548,10 +578,13 @@ class NomadSyncAgent(Agent):
             }
             await self._send_payment_transaction(transaction_data)
             print(f"   ✅ [SUCCESS] Payment request sent to frontend")
+
             return {
                 "status": "pending_confirmation",
-                "message": f"Payment request for ${amount_usd:.2f} sent. Waiting for user confirmation. (Demo: 0.1 SOL)",
-                "amount_usd": amount_usd,
+                "message": f"Booking ${paid_now:.2f} now (hotels + activities). Restaurants ${pay_later:.2f} pay at venue. Total trip: ${estimated_total:.2f}",
+                "paid_now_usd": paid_now,
+                "pay_later_usd": pay_later,
+                "estimated_total_usd": estimated_total,
                 "amount_sol": 0.1,
                 "item_description": item_description
             }
