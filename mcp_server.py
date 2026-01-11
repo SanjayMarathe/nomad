@@ -1,9 +1,11 @@
 """
 MCP Tool Server using FastAPI
 Provides travel search tools: Yelp, Tripadvisor, Hotels
+Uses Yelp MCP Server for real-time business data
 """
 
 import os
+import sys
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -14,16 +16,39 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+# Add yelp-mcp to Python path for importing
+YELP_MCP_PATH = os.path.join(os.path.dirname(__file__), "yelp-mcp", "src")
+if YELP_MCP_PATH not in sys.path:
+    sys.path.insert(0, YELP_MCP_PATH)
+
+# Import Yelp MCP functions
+try:
+    from yelp_agent.api import make_fusion_ai_request, UserContext
+    from yelp_agent.formatters import format_fusion_ai_response
+    YELP_MCP_AVAILABLE = True
+    print("✅ Yelp MCP module loaded successfully")
+except ImportError as e:
+    print(f"⚠️ Could not import yelp-mcp: {e}")
+    YELP_MCP_AVAILABLE = False
+
 # Mapbox API configuration
 MAPBOX_ACCESS_TOKEN = os.getenv("MAPBOX_ACCESS_TOKEN") or os.getenv("NEXT_PUBLIC_MAPBOX_TOKEN")
 MAPBOX_DIRECTIONS_API = "https://api.mapbox.com/directions/v5"
 MAPBOX_GEOCODING_API = "https://api.mapbox.com/geocoding/v5/mapbox.places"
 
-# Log whether Mapbox token is configured
+# Yelp Fusion AI API configuration
+YELP_API_KEY = os.getenv("YELP_API_KEY")
+
+# Log API configurations
 if MAPBOX_ACCESS_TOKEN:
     print(f"✅ Mapbox token configured: {MAPBOX_ACCESS_TOKEN[:10]}...")
 else:
     print("⚠️ WARNING: No Mapbox token found! Set MAPBOX_ACCESS_TOKEN or NEXT_PUBLIC_MAPBOX_TOKEN in .env")
+
+if YELP_API_KEY:
+    print(f"✅ Yelp API key configured: {YELP_API_KEY[:10]}...")
+else:
+    print("⚠️ WARNING: No Yelp API key found! Set YELP_API_KEY in .env for restaurant/business search")
 
 # Initialize FastAPI server
 app = FastAPI(title="NomadSync Travel Tools MCP Server")
@@ -219,13 +244,80 @@ async def get_route_from_mapbox(waypoint_coords: list, route_type: str = "drivin
         return None
 
 
+async def call_yelp_fusion_ai(query: str, lat: float = None, lng: float = None, chat_id: str = None) -> dict:
+    """
+    Call Yelp Fusion AI API using the yelp-mcp module for real-time business data.
+    Returns structured business data with ratings, reviews, and more.
+    """
+    if not YELP_API_KEY:
+        print("⚠️ [YELP] No API key configured")
+        return None
+    
+    if not YELP_MCP_AVAILABLE:
+        print("⚠️ [YELP] Yelp MCP module not available")
+        return None
+    
+    print(f"🔍 [YELP MCP] Querying: '{query}'")
+    if lat and lng:
+        print(f"   📍 Location context: ({lat}, {lng})")
+    
+    try:
+        # Build user context for location-specific searches
+        user_context = None
+        if lat is not None and lng is not None:
+            user_context = UserContext(latitude=lat, longitude=lng)
+        
+        # Call Yelp Fusion AI via the yelp-mcp module
+        response = await make_fusion_ai_request(
+            query=query,
+            chat_id=chat_id,
+            user_context=user_context
+        )
+        
+        if not response:
+            print("❌ [YELP MCP] No response from Yelp API")
+            return None
+        
+        # Extract data from response
+        result_chat_id = response.get("chat_id")
+        response_text = response.get("response", {}).get("text", "")
+        entities = response.get("entities", [])
+        
+        # Extract businesses from entities
+        businesses = []
+        for entity in entities:
+            if "businesses" in entity:
+                businesses.extend(entity["businesses"])
+        
+        print(f"✅ [YELP MCP] Found {len(businesses)} businesses")
+        
+        # Also get formatted output for logging
+        formatted = format_fusion_ai_response(response)
+        print(f"📋 [YELP MCP] Response preview: {formatted[:200]}...")
+        
+        return {
+            "chat_id": result_chat_id,
+            "response_text": response_text,
+            "businesses": businesses,
+            "formatted_response": formatted,
+            "raw_response": response
+        }
+        
+    except Exception as e:
+        print(f"❌ [YELP MCP] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 @app.post("/tools/search_restaurants")
 async def search_restaurants(params: dict) -> dict:
     """
-    Search for restaurants in a location using Yelp.
+    Search for restaurants in a location using Yelp Fusion AI MCP.
+    Returns real-time data with ratings, reviews, photos, and more.
     """
     location = params.get("location")
-    food_type = params.get("food_type")
+    food_type = params.get("food_type", "")
     
     if not location:
         raise HTTPException(status_code=400, detail="location is required")
@@ -233,53 +325,103 @@ async def search_restaurants(params: dict) -> dict:
     # Get coordinates for the location
     lat, lng = await get_location_coordinates(location)
     
-    # Mock Yelp API response (in production, use actual Yelp Fusion API)
-    # Yelp API requires: https://www.yelp.com/developers/documentation/v3
-    restaurants = [
-        {
-            "name": f"Amazing {food_type or 'Restaurant'} 1",
-            "rating": 4.5,
-            "price": "$$",
-            "address": f"123 Main St, {location}",
-            "photo_url": "https://via.placeholder.com/300x200",
-            "coordinates": [lat + 0.01, lng + 0.01],
-            "yelp_url": f"https://yelp.com/biz/restaurant-1-{location.lower().replace(' ', '-')}"
-        },
-        {
-            "name": f"Delicious {food_type or 'Restaurant'} 2",
-            "rating": 4.7,
-            "price": "$$$",
-            "address": f"456 Oak Ave, {location}",
-            "photo_url": "https://via.placeholder.com/300x200",
-            "coordinates": [lat + 0.02, lng - 0.01],
-            "yelp_url": f"https://yelp.com/biz/restaurant-2-{location.lower().replace(' ', '-')}"
-        },
-        {
-            "name": f"Top Rated {food_type or 'Restaurant'} 3",
-            "rating": 4.8,
-            "price": "$",
-            "address": f"789 Pine St, {location}",
-            "photo_url": "https://via.placeholder.com/300x200",
-            "coordinates": [lat - 0.01, lng + 0.02],
-            "yelp_url": f"https://yelp.com/biz/restaurant-3-{location.lower().replace(' ', '-')}"
+    print(f"🍽️ [RESTAURANTS] Searching for {food_type or 'restaurants'} in {location} ({lat}, {lng})")
+    
+    restaurants = []
+    yelp_response_text = ""
+    yelp_chat_id = None
+    
+    # Use Yelp Fusion AI via MCP
+    if YELP_API_KEY and YELP_MCP_AVAILABLE:
+        query = f"Find the best {food_type + ' ' if food_type else ''}restaurants in {location}"
+        result = await call_yelp_fusion_ai(query, lat, lng)
+        
+        if result and result.get("businesses"):
+            yelp_response_text = result.get("response_text", "")
+            yelp_chat_id = result.get("chat_id")
+            
+            for biz in result["businesses"][:5]:  # Top 5 results
+                # Get coordinates if available
+                coords = biz.get("coordinates", {})
+                biz_lat = coords.get("latitude", lat)
+                biz_lng = coords.get("longitude", lng)
+                
+                # Get location info
+                location_info = biz.get("location", {})
+                address = location_info.get("formatted_address", "")
+                if not address:
+                    address = ", ".join(location_info.get("display_address", [f"Near {location}"]))
+                
+                # Get contextual info (hours, reviews, photos)
+                contextual = biz.get("contextual_info", {})
+                review_snippet = contextual.get("review_snippet", "")
+                if review_snippet:
+                    review_snippet = review_snippet.replace("[[HIGHLIGHT]]", "").replace("[[ENDHIGHLIGHT]]", "")
+                
+                # Get photos
+                photos = contextual.get("photos", [])
+                photo_urls = [p.get("original_url") for p in photos if p.get("original_url")]
+                
+                # Get attributes (amenities)
+                attributes = biz.get("attributes", {})
+                
+                restaurant = {
+                    "name": biz.get("name", "Unknown Restaurant"),
+                    "rating": biz.get("rating", 0),
+                    "review_count": biz.get("review_count", 0),
+                    "price": biz.get("price", "$$"),
+                    "address": address,
+                    "phone": biz.get("phone", biz.get("display_phone", "")),
+                    "coordinates": [biz_lat, biz_lng],
+                    "yelp_url": biz.get("url", f"https://yelp.com/search?find_desc=restaurant&find_loc={location}"),
+                    "image_url": biz.get("image_url", photo_urls[0] if photo_urls else "https://via.placeholder.com/300x200"),
+                    "photos": photo_urls[:3],  # Up to 3 photos
+                    "categories": [cat.get("title", "") for cat in biz.get("categories", [])],
+                    "is_closed": biz.get("is_closed", False),
+                    "review_highlight": review_snippet,
+                    "website": attributes.get("BusinessUrl", ""),
+                    "delivery": attributes.get("RestaurantsDelivery", False),
+                    "takeout": attributes.get("RestaurantsTakeOut", False),
+                    "reservations": attributes.get("RestaurantsReservations", False),
+                    "outdoor_seating": attributes.get("OutdoorSeating", False),
+                }
+                restaurants.append(restaurant)
+            
+            print(f"✅ [RESTAURANTS] Found {len(restaurants)} restaurants via Yelp Fusion AI MCP")
+    
+    # Return error if no results
+    if not restaurants:
+        print(f"⚠️ [RESTAURANTS] No results found - Yelp API key may be missing")
+        return {
+            "location": location,
+            "food_type": food_type,
+            "restaurants": [],
+            "coordinates": [lat, lng],
+            "count": 0,
+            "error": "No restaurants found. Please ensure YELP_API_KEY is configured.",
+            "yelp_available": bool(YELP_API_KEY and YELP_MCP_AVAILABLE)
         }
-    ]
     
     return {
         "location": location,
         "food_type": food_type,
         "restaurants": restaurants,
-        "coordinates": [lat, lng],  # Center coordinates for map
-        "count": len(restaurants)
+        "coordinates": [lat, lng],
+        "count": len(restaurants),
+        "yelp_response": yelp_response_text,
+        "chat_id": yelp_chat_id,
+        "yelp_available": True
     }
 
 
 @app.post("/tools/get_activities")
 async def get_activities(params: dict) -> dict:
     """
-    Get top-rated activities and attractions from Tripadvisor.
+    Get top-rated activities and attractions using Yelp Fusion AI MCP.
+    Returns real-time data with ratings, reviews, photos, and more.
     """
     location = params.get("location")
+    activity_type = params.get("activity_type", "")  # Optional filter
     
     if not location:
         raise HTTPException(status_code=400, detail="location is required")
@@ -287,50 +429,99 @@ async def get_activities(params: dict) -> dict:
     # Get coordinates for the location
     lat, lng = await get_location_coordinates(location)
     
-    # Mock Tripadvisor API response (in production, use actual Tripadvisor API)
-    # Tripadvisor API: https://developer.tripadvisor.com/content-api/
-    activities = [
-        {
-            "name": f"Historic Landmark in {location}",
-            "rating": 4.6,
-            "type": "Attraction",
-            "address": f"100 Heritage Blvd, {location}",
-            "photo_url": "https://via.placeholder.com/300x200",
-            "coordinates": [lat + 0.015, lng + 0.015],
-            "tripadvisor_url": f"https://tripadvisor.com/attraction-1-{location.lower().replace(' ', '-')}"
-        },
-        {
-            "name": f"Scenic Viewpoint in {location}",
-            "rating": 4.8,
-            "type": "Viewpoint",
-            "address": f"200 Mountain Rd, {location}",
-            "photo_url": "https://via.placeholder.com/300x200",
-            "coordinates": [lat - 0.015, lng + 0.02],
-            "tripadvisor_url": f"https://tripadvisor.com/attraction-2-{location.lower().replace(' ', '-')}"
-        },
-        {
-            "name": f"Cultural Museum in {location}",
-            "rating": 4.7,
-            "type": "Museum",
-            "address": f"300 Culture Ave, {location}",
-            "photo_url": "https://via.placeholder.com/300x200",
-            "coordinates": [lat + 0.02, lng - 0.015],
-            "tripadvisor_url": f"https://tripadvisor.com/attraction-3-{location.lower().replace(' ', '-')}"
+    print(f"🎯 [ACTIVITIES] Searching for activities in {location} ({lat}, {lng})")
+    
+    activities = []
+    yelp_response_text = ""
+    yelp_chat_id = None
+    
+    # Use Yelp Fusion AI via MCP
+    if YELP_API_KEY and YELP_MCP_AVAILABLE:
+        query = f"What are the top {activity_type + ' ' if activity_type else ''}things to do and attractions in {location}?"
+        result = await call_yelp_fusion_ai(query, lat, lng)
+        
+        if result and result.get("businesses"):
+            yelp_response_text = result.get("response_text", "")
+            yelp_chat_id = result.get("chat_id")
+            
+            for biz in result["businesses"][:5]:  # Top 5 results
+                coords = biz.get("coordinates", {})
+                biz_lat = coords.get("latitude", lat)
+                biz_lng = coords.get("longitude", lng)
+                
+                # Get location info
+                location_info = biz.get("location", {})
+                address = location_info.get("formatted_address", "")
+                if not address:
+                    address = ", ".join(location_info.get("display_address", [f"Near {location}"]))
+                
+                # Get primary category
+                categories = biz.get("categories", [])
+                primary_type = categories[0].get("title", "Attraction") if categories else "Attraction"
+                
+                # Get contextual info
+                contextual = biz.get("contextual_info", {})
+                review_snippet = contextual.get("review_snippet", "")
+                if review_snippet:
+                    review_snippet = review_snippet.replace("[[HIGHLIGHT]]", "").replace("[[ENDHIGHLIGHT]]", "")
+                
+                # Get photos
+                photos = contextual.get("photos", [])
+                photo_urls = [p.get("original_url") for p in photos if p.get("original_url")]
+                
+                # Get attributes
+                attributes = biz.get("attributes", {})
+                
+                activity = {
+                    "name": biz.get("name", "Unknown Activity"),
+                    "rating": biz.get("rating", 0),
+                    "review_count": biz.get("review_count", 0),
+                    "type": primary_type,
+                    "address": address,
+                    "phone": biz.get("phone", biz.get("display_phone", "")),
+                    "coordinates": [biz_lat, biz_lng],
+                    "yelp_url": biz.get("url", f"https://yelp.com/search?find_desc=things+to+do&find_loc={location}"),
+                    "image_url": biz.get("image_url", photo_urls[0] if photo_urls else "https://via.placeholder.com/300x200"),
+                    "photos": photo_urls[:3],
+                    "categories": [cat.get("title", "") for cat in categories],
+                    "is_closed": biz.get("is_closed", False),
+                    "review_highlight": review_snippet,
+                    "website": attributes.get("BusinessUrl", ""),
+                    "wheelchair_accessible": attributes.get("WheelchairAccessible", False),
+                    "good_for_kids": attributes.get("GoodForKids", False),
+                }
+                activities.append(activity)
+            
+            print(f"✅ [ACTIVITIES] Found {len(activities)} activities via Yelp Fusion AI MCP")
+    
+    # Return error if no results
+    if not activities:
+        print(f"⚠️ [ACTIVITIES] No results found - Yelp API key may be missing")
+        return {
+            "location": location,
+            "activities": [],
+            "coordinates": [lat, lng],
+            "count": 0,
+            "error": "No activities found. Please ensure YELP_API_KEY is configured.",
+            "yelp_available": bool(YELP_API_KEY and YELP_MCP_AVAILABLE)
         }
-    ]
     
     return {
         "location": location,
         "activities": activities,
-        "coordinates": [lat, lng],  # Center coordinates for map
-        "count": len(activities)
+        "coordinates": [lat, lng],
+        "count": len(activities),
+        "yelp_response": yelp_response_text,
+        "chat_id": yelp_chat_id,
+        "yelp_available": True
     }
 
 
 @app.post("/tools/search_hotels")
 async def search_hotels(params: dict) -> dict:
     """
-    Search for hotels and accommodations.
+    Search for hotels and accommodations using Yelp Fusion AI MCP.
+    Returns real-time data with ratings, reviews, photos, and more.
     """
     location = params.get("location")
     budget_sol = params.get("budget_sol", 0.0)
@@ -341,50 +532,99 @@ async def search_hotels(params: dict) -> dict:
     # Get coordinates for the location
     lat, lng = await get_location_coordinates(location)
     
-    # Mock Google Hotels API response (in production, use actual Google Hotels API or similar)
-    hotels = [
-        {
-            "name": f"Luxury Hotel {location}",
-            "rating": 4.5,
-            "price_per_night_usd": 200,
-            "price_per_night_sol": 0.5,  # Mock conversion
-            "address": f"500 Luxury Ln, {location}",
-            "photo_url": "https://via.placeholder.com/300x200",
-            "coordinates": [lat + 0.01, lng + 0.01],
-            "amenities": ["Pool", "Spa", "Gym", "WiFi"]
-        },
-        {
-            "name": f"Budget Inn {location}",
-            "rating": 4.0,
-            "price_per_night_usd": 80,
-            "price_per_night_sol": 0.2,
-            "address": f"600 Budget St, {location}",
-            "photo_url": "https://via.placeholder.com/300x200",
-            "coordinates": [lat - 0.01, lng + 0.01],
-            "amenities": ["WiFi", "Parking"]
-        },
-        {
-            "name": f"Boutique Hotel {location}",
-            "rating": 4.7,
-            "price_per_night_usd": 150,
-            "price_per_night_sol": 0.375,
-            "address": f"700 Boutique Ave, {location}",
-            "photo_url": "https://via.placeholder.com/300x200",
-            "coordinates": [lat + 0.01, lng - 0.01],
-            "amenities": ["WiFi", "Breakfast", "Pet Friendly"]
-        }
-    ]
+    print(f"🏨 [HOTELS] Searching for hotels in {location} ({lat}, {lng})")
     
-    # Filter by budget if provided
-    if budget_sol > 0:
-        hotels = [h for h in hotels if h["price_per_night_sol"] <= budget_sol]
+    hotels = []
+    yelp_response_text = ""
+    yelp_chat_id = None
+    
+    # Use Yelp Fusion AI via MCP
+    if YELP_API_KEY and YELP_MCP_AVAILABLE:
+        query = f"Find the best hotels and places to stay in {location}"
+        result = await call_yelp_fusion_ai(query, lat, lng)
+        
+        if result and result.get("businesses"):
+            yelp_response_text = result.get("response_text", "")
+            yelp_chat_id = result.get("chat_id")
+            
+            for biz in result["businesses"][:5]:  # Top 5 results
+                coords = biz.get("coordinates", {})
+                biz_lat = coords.get("latitude", lat)
+                biz_lng = coords.get("longitude", lng)
+                
+                # Get location info
+                location_info = biz.get("location", {})
+                address = location_info.get("formatted_address", "")
+                if not address:
+                    address = ", ".join(location_info.get("display_address", [f"Near {location}"]))
+                
+                # Get contextual info
+                contextual = biz.get("contextual_info", {})
+                review_snippet = contextual.get("review_snippet", "")
+                if review_snippet:
+                    review_snippet = review_snippet.replace("[[HIGHLIGHT]]", "").replace("[[ENDHIGHLIGHT]]", "")
+                
+                # Get photos
+                photos = contextual.get("photos", [])
+                photo_urls = [p.get("original_url") for p in photos if p.get("original_url")]
+                
+                # Get attributes
+                attributes = biz.get("attributes", {})
+                
+                # Extract amenities from attributes
+                amenities = []
+                if attributes.get("WiFi") and attributes.get("WiFi") != "no":
+                    amenities.append("WiFi")
+                if attributes.get("BusinessParking"):
+                    amenities.append("Parking")
+                if attributes.get("WheelchairAccessible"):
+                    amenities.append("Accessible")
+                if attributes.get("DogsAllowed"):
+                    amenities.append("Pet Friendly")
+                
+                hotel = {
+                    "name": biz.get("name", "Unknown Hotel"),
+                    "rating": biz.get("rating", 0),
+                    "review_count": biz.get("review_count", 0),
+                    "price": biz.get("price", "$$"),
+                    "address": address,
+                    "phone": biz.get("phone", biz.get("display_phone", "")),
+                    "coordinates": [biz_lat, biz_lng],
+                    "yelp_url": biz.get("url", f"https://yelp.com/search?find_desc=hotels&find_loc={location}"),
+                    "image_url": biz.get("image_url", photo_urls[0] if photo_urls else "https://via.placeholder.com/300x200"),
+                    "photos": photo_urls[:3],
+                    "categories": [cat.get("title", "") for cat in biz.get("categories", [])],
+                    "is_closed": biz.get("is_closed", False),
+                    "review_highlight": review_snippet,
+                    "amenities": amenities,
+                    "website": attributes.get("BusinessUrl", ""),
+                }
+                hotels.append(hotel)
+            
+            print(f"✅ [HOTELS] Found {len(hotels)} hotels via Yelp Fusion AI MCP")
+    
+    # Return error if no results
+    if not hotels:
+        print(f"⚠️ [HOTELS] No results found - Yelp API key may be missing")
+        return {
+            "location": location,
+            "budget_sol": budget_sol,
+            "hotels": [],
+            "coordinates": [lat, lng],
+            "count": 0,
+            "error": "No hotels found. Please ensure YELP_API_KEY is configured.",
+            "yelp_available": bool(YELP_API_KEY and YELP_MCP_AVAILABLE)
+        }
     
     return {
         "location": location,
         "budget_sol": budget_sol,
         "hotels": hotels,
-        "coordinates": [lat, lng],  # Center coordinates for map
-        "count": len(hotels)
+        "coordinates": [lat, lng],
+        "count": len(hotels),
+        "yelp_response": yelp_response_text,
+        "chat_id": yelp_chat_id,
+        "yelp_available": True
     }
 
 
@@ -520,6 +760,32 @@ async def root():
 async def health():
     """Health check endpoint"""
     return {"status": "ok"}
+
+@app.get("/status")
+async def status():
+    """Get detailed status of all integrations"""
+    return {
+        "status": "healthy",
+        "integrations": {
+            "yelp": {
+                "available": bool(YELP_API_KEY and YELP_MCP_AVAILABLE),
+                "api_key_configured": bool(YELP_API_KEY),
+                "mcp_module_loaded": YELP_MCP_AVAILABLE,
+                "description": "Yelp Fusion AI for restaurants, activities, hotels"
+            },
+            "mapbox": {
+                "available": bool(MAPBOX_ACCESS_TOKEN),
+                "api_key_configured": bool(MAPBOX_ACCESS_TOKEN),
+                "description": "Mapbox for geocoding and routing"
+            }
+        },
+        "services": {
+            "search_restaurants": bool(YELP_API_KEY and YELP_MCP_AVAILABLE),
+            "get_activities": bool(YELP_API_KEY and YELP_MCP_AVAILABLE),
+            "search_hotels": bool(YELP_API_KEY and YELP_MCP_AVAILABLE),
+            "update_map": bool(MAPBOX_ACCESS_TOKEN)
+        }
+    }
 
 @app.get("/tools")
 async def list_tools():
