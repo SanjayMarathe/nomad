@@ -21,6 +21,7 @@ When testing route planning, you should see:
 import asyncio
 import json
 import os
+import time
 from typing import Annotated, Optional
 from dotenv import load_dotenv
 import httpx
@@ -1229,6 +1230,14 @@ async def entrypoint(ctx: JobContext):
                 print(f"👤 [USER MESSAGE] \"{text}\"")
             elif role == "assistant":
                 print(f"🤖 [AGENT RESPONSE] \"{text}\"")
+                # Send agent transcript to frontend for display
+                if text and len(text.strip()) > 0:
+                    asyncio.create_task(agent._send_data_message({
+                        "type": "TRANSCRIPT",
+                        "role": "assistant",
+                        "text": text,
+                        "timestamp": int(time.time() * 1000)
+                    }))
             elif role == "tool" or role == "function":
                 print(f"🔧 [TOOL RESULT] {text}")
             
